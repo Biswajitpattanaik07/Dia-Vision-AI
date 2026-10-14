@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}History | DiaVision AI{% endblock %}
+{% block page_title %}Prediction History{% endblock %}
+
+{% block content %}
+<div class="flex justify-between items-center">
+  <h2 class="text-headline-lg font-headline-lg text-white">Prediction History</h2>
+  <form method="GET" class="flex items-center gap-2">
+    <select name="label" onchange="this.form.submit()" class="bg-black border border-white/10 rounded-lg px-4 py-2 text-white text-body-md">
+      <option value="" {{ 'selected' if not filter_label }}>All Findings</option>
+      {% for c in class_names %}
+        <option value="{{ c }}" {{ 'selected' if filter_label==c }}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="glass-card rounded-2xl overflow-hidden">
+  <table class="w-full text-left">
+    <thead class="bg-white/5 text-on-surface-variant text-label-sm uppercase tracking-wider">
+      <tr>
+        <th class="px-6 py-4">Patient</th>
+        <th class="px-6 py-4">Date</th>
+        <th class="px-6 py-4">Finding</th>
+        <th class="px-6 py-4">Confidence</th>
+        <th class="px-6 py-4">Reviewed By</th>
+        <th class="px-6 py-4"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-white/5">
+      {% for a in records %}
+      <tr class="hover:bg-white/5 transition-colors">
+        <td class="px-6 py-4 text-white font-semibold">
+          <a href="{{ url_for('patient_profile', patient_id=a.patient.id) }}" class="hover:text-primary">{{ a.patient.name }}</a>
+        </td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ a.created_at.strftime('%b %d, %Y %H:%M') }}</td>
+        <td class="px-6 py-4">
+          <span class="px-3 py-1 rounded-full text-label-sm font-semibold border
+            {{ 'bg-secondary/10 text-secondary border-secondary/20' if a.prediction_label=='No DR' else 'bg-error/10 text-error border-error/20' }}">
+            {{ a.prediction_label }}
+          </span>
+        </td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ (a.confidence*100)|round(1) }}%</td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ a.reviewed_by or '—' }}</td>
+        <td class="px-6 py-4 text-right">
+          <a href="{{ url_for('result', analysis_id=a.id) }}" class="text-primary text-label-sm font-bold uppercase tracking-wider hover:underline">View</a>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="px-6 py-10 text-center text-on-surface-variant">No screenings found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

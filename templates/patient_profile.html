@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ patient.name }} | DiaVision AI{% endblock %}
+{% block page_title %}Patient Profile{% endblock %}
+
+{% block content %}
+<div class="flex justify-between items-end mb-2">
+  <div class="space-y-1">
+    <nav class="flex items-center gap-2 text-label-sm text-on-surface-variant mb-3">
+      <a class="hover:text-primary transition-colors" href="{{ url_for('patients') }}">Patients</a>
+      <span class="material-symbols-outlined text-[14px]">chevron_right</span>
+      <span class="text-primary font-medium">{{ patient.patient_code }}</span>
+    </nav>
+    <div class="flex items-center gap-4">
+      <h2 class="text-display-lg font-headline-lg text-white" style="font-size:36px;">{{ patient.name }}</h2>
+      {% if patient.diabetes_type %}
+      <span class="px-3 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 text-label-sm font-semibold uppercase tracking-wider">{{ patient.diabetes_type }}</span>
+      {% endif %}
+    </div>
+    <div class="flex gap-8 mt-4 text-on-surface-variant">
+      <span class="flex items-center gap-2"><span class="material-symbols-outlined text-lg text-primary/70">fingerprint</span>ID: {{ patient.patient_code }}</span>
+      <span class="flex items-center gap-2"><span class="material-symbols-outlined text-lg text-primary/70">calendar_month</span>Age: {{ patient.age or '—' }}</span>
+      {% if patient.city %}<span class="flex items-center gap-2"><span class="material-symbols-outlined text-lg text-primary/70">location_on</span>{{ patient.city }}</span>{% endif %}
+    </div>
+  </div>
+  <a href="{{ url_for('analysis') }}" class="bg-primary text-on-primary px-6 py-2.5 rounded-xl font-semibold flex items-center gap-2 hover:opacity-90 transition-all">
+    <span class="material-symbols-outlined text-lg">add_chart</span> New Screening
+  </a>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-gutter">
+  <div class="glass-card rounded-2xl p-6 amethyst-glow">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Total Screenings</p>
+    <h3 class="text-display-lg font-headline-lg text-white" style="font-size:36px;">{{ patient.total_screenings }}</h3>
+  </div>
+  <div class="glass-card rounded-2xl p-6">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Latest Result</p>
+    {% if patient.latest_analysis %}
+      <h3 class="text-headline-lg font-headline-lg {{ 'text-secondary' if patient.latest_analysis.prediction_label=='No DR' else 'text-error' }}">{{ patient.latest_analysis.prediction_label }}</h3>
+      <p class="text-on-surface-variant text-label-sm mt-3">{{ patient.latest_analysis.created_at.strftime('%b %d, %Y') }}</p>
+    {% else %}
+      <h3 class="text-headline-lg font-headline-lg text-on-surface-variant">No data</h3>
+    {% endif %}
+  </div>
+  <div class="glass-card rounded-2xl p-6">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Condition Duration</p>
+    <h3 class="text-display-lg font-headline-lg text-white" style="font-size:36px;">{{ patient.duration_years or '—' }}<span class="text-label-sm"> yrs</span></h3>
+  </div>
+</div>
+
+{% if patient.notes %}
+<div class="glass-card rounded-2xl p-6">
+  <p class="text-label-sm text-on-surface-variant uppercase tracking-widest mb-2">Clinical Notes</p>
+  <p class="text-on-surface-variant leading-relaxed">{{ patient.notes }}</p>
+</div>
+{% endif %}
+
+<div class="space-y-4">
+  <h4 class="text-headline-md font-headline-md text-white">Screening History</h4>
+  {% if patient.analyses %}
+  <div class="timeline-line relative space-y-6 pl-10">
+    {% for a in patient.analyses %}
+    <div class="relative">
+      <div class="absolute -left-10 top-0 w-10 h-10 rounded-full flex items-center justify-center border-4 border-black z-10
+        {{ 'bg-primary' if loop.first else 'bg-white/10' }}">
+        <span class="material-symbols-outlined {{ 'text-black' if loop.first else 'text-on-surface-variant' }} text-lg">biotech</span>
+      </div>
+      <a href="{{ url_for('result', analysis_id=a.id) }}" class="block glass-card rounded-2xl p-6 hover:bg-white/[0.06] transition-all">
+        <div class="flex justify-between items-start">
+          <div>
+            <span class="text-label-sm text-primary font-bold uppercase tracking-widest">{{ a.created_at.strftime('%B %d, %Y') }}</span>
+            <h5 class="text-headline-md font-headline-md mt-1 text-white" style="font-size:18px;">{{ a.prediction_label }}</h5>
+          </div>
+          <div class="text-right">
+            <div class="text-secondary font-bold">{{ (a.confidence*100)|round(1) }}% confidence</div>
+            <div class="text-on-surface-variant text-label-sm mt-1">Reviewed by: {{ a.reviewed_by or 'Pending' }}</div>
+          </div>
+        </div>
+      </a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="glass-card rounded-2xl p-8 text-center text-on-surface-variant">No screenings recorded yet.</div>
+  {% endif %}
+</div>
+{% endblock %}

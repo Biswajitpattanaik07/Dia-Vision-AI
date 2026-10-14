@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Developer & Support | DiaVision AI{% endblock %}
+{% block page_title %}Developer & Support{% endblock %}
+
+{% block content %}
+<style>
+  .contact-card {
+    display: flex; align-items: center; gap: 1rem;
+    padding: 1rem 1.25rem; border-radius: 1rem;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.03);
+    color: #fff; text-decoration: none;
+    transition: border-color .15s, background .15s, transform .15s;
+  }
+  .contact-card:hover, .contact-card:focus-visible {
+    border-color: var(--brand, #c4b5fd); background: rgba(255,255,255,.07); transform: translateY(-2px);
+  }
+  .contact-card:focus-visible { outline: 2px solid var(--brand, #c4b5fd); outline-offset: 2px; }
+  .contact-icon {
+    flex: none; width: 52px; height: 52px; border-radius: 9999px;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; background: var(--brand, #7c3aed);
+  }
+  .contact-icon svg { width: 26px; height: 26px; }
+  .contact-icon.insta { background: linear-gradient(45deg, #f09433, #dc2743 55%, #bc1888); }
+  .contact-title { font-weight: 700; font-size: 1rem; }
+  .contact-sub { font-size: .85rem; color: rgba(255,255,255,.6); overflow-wrap: anywhere; }
+  .contact-go { margin-left: auto; color: rgba(255,255,255,.4); }
+  .contact-card:hover .contact-go { color: var(--brand, #c4b5fd); }
+  @media (prefers-reduced-motion: reduce) { .contact-card { transition: none; transform: none !important; } }
+</style>
+
+<div class="max-w-2xl mx-auto">
+
+  <!-- Developer profile -->
+  <div class="glass-panel rounded-2xl p-6 mb-6 flex items-center gap-5">
+    <div class="flex-none w-20 h-20 rounded-full bg-primary text-on-primary flex items-center justify-center text-3xl font-bold">
+      {{ dev.initial }}
+    </div>
+    <div>
+      <h2 class="text-headline-lg font-headline-lg text-white">{{ dev.name }}</h2>
+      <p class="text-primary font-semibold">{{ dev.role }}</p>
+      <p class="text-on-surface-variant mt-1">{{ dev.bio }}</p>
+    </div>
+  </div>
+
+  <h3 class="text-white font-bold mb-3">Connect with the developer</h3>
+  <div class="grid gap-3 mb-8">
+
+    <!-- LinkedIn: opens the profile in a new tab -->
+    <a class="contact-card" style="--brand:#0a66c2" href="{{ dev.linkedin }}" target="_blank" rel="noopener noreferrer" aria-label="Open LinkedIn profile">
+      <span class="contact-icon">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 01-2.063-2.065 2.064 2.064 0 112.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>
+      </span>
+      <span>
+        <div class="contact-title">LinkedIn</div>
+        <div class="contact-sub">View professional profile</div>
+      </span>
+      <span class="material-symbols-outlined contact-go">open_in_new</span>
+    </a>
+
+    <!-- Instagram: opens the profile in a new tab -->
+    <a class="contact-card" style="--brand:#dc2743" href="{{ dev.instagram }}" target="_blank" rel="noopener noreferrer" aria-label="Open Instagram profile">
+      <span class="contact-icon insta">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="5"/>
+          <circle cx="12" cy="12" r="4"/>
+          <circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+      </span>
+      <span>
+        <div class="contact-title">Instagram</div>
+        <div class="contact-sub">Follow on Instagram</div>
+      </span>
+      <span class="material-symbols-outlined contact-go">open_in_new</span>
+    </a>
+  </div>
+
+  <h3 class="text-white font-bold mb-3">Support team</h3>
+  <div class="grid gap-3">
+
+    <!-- Phone: opens the dialer (phones) or the default calling app (desktop) -->
+    <a class="contact-card" style="--brand:#22c55e" href="tel:{{ dev.support_phone_link }}" aria-label="Call support team">
+      <span class="contact-icon" style="background:#16a34a">
+        <span class="material-symbols-outlined" style="font-size:26px;font-variation-settings:'FILL' 1;">call</span>
+      </span>
+      <span>
+        <div class="contact-title">Call support</div>
+        <div class="contact-sub">{{ dev.support_phone }}</div>
+      </span>
+      <span class="material-symbols-outlined contact-go">arrow_forward</span>
+    </a>
+
+    {% if dev.support_email %}
+    <a class="contact-card" style="--brand:#c4b5fd" href="mailto:{{ dev.support_email }}" aria-label="Email support team">
+      <span class="contact-icon" style="background:#7c3aed">
+        <span class="material-symbols-outlined" style="font-size:26px;font-variation-settings:'FILL' 1;">mail</span>
+      </span>
+      <span>
+        <div class="contact-title">Email support</div>
+        <div class="contact-sub">{{ dev.support_email }}</div>
+      </span>
+      <span class="material-symbols-outlined contact-go">arrow_forward</span>
+    </a>
+    {% endif %}
+  </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,130 @@
+/* DiaVision AI — shared styles (dark amethyst theme) */
+body {
+    background-color: #000000;
+    color: #ffffff;
+    -webkit-font-smoothing: antialiased;
+}
+
+.glass-card {
+    background: rgba(18, 18, 20, 0.8);
+    backdrop-filter: blur(24px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-panel {
+    background: rgba(18, 18, 18, 0.7);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.shimmer-border {
+    position: relative;
+    background: linear-gradient(#000000, #000000) padding-box,
+                linear-gradient(to right, #1a1a1a, #8B5CF6) border-box;
+    border: 1px solid transparent;
+}
+
+.amethyst-glow {
+    box-shadow: 0 0 40px 0 rgba(139, 92, 246, 0.12);
+}
+
+.timeline-line {
+    position: relative;
+}
+.timeline-line::before {
+    content: '';
+    position: absolute;
+    left: 19px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: linear-gradient(to bottom, #8B5CF6, transparent);
+    opacity: 0.4;
+}
+
+.bg-mesh {
+    background-color: #000000;
+    background-image:
+        radial-gradient(at 0% 0%, rgba(139, 92, 246, 0.2) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(208, 188, 255, 0.1) 0px, transparent 50%);
+}
+
+@keyframes pulse-slow {
+    0%, 100% { opacity: 0.2; }
+    50% { opacity: 0.5; }
+}
+.animate-pulse-slow { animation: pulse-slow 8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #000000; }
+::-webkit-scrollbar-thumb { background: #262626; border-radius: 10px; }
+
+.nav-link {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: #a19daa;
+    padding: 0.75rem 1rem;
+    transition: all .3s;
+    position: relative;
+}
+.nav-link:hover { color: #fff; background: rgba(255,255,255,0.05); }
+.nav-link.active {
+    background: rgba(160, 120, 255, 0.1);
+    color: #d0bcff;
+    border-left: 4px solid #d0bcff;
+    border-radius: 0 0.5rem 0.5rem 0;
+    transform: translateX(4px);
+}
+
+/* --- Sliding active-indicator that jumps between nav items on hover --- */
+#nav-slider {
+    position: absolute;
+    left: 0;
+    width: 4px;
+    background: #d0bcff;
+    border-radius: 0 4px 4px 0;
+    box-shadow: 0 0 12px 2px rgba(208,188,255,0.6);
+    transition: top 0.35s cubic-bezier(0.34, 1.56, 0.64, 1), height 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+    pointer-events: none;
+    opacity: 0;
+}
+#nav-slider.visible { opacity: 1; }
+
+.drop-zone.dragover {
+    background: rgba(160, 120, 255, 0.1);
+    border-color: #8B5CF6;
+}
+
+/* --- 3D tilt + cursor-follow glow + jump-pop on click, applied to any
+   glass-card / glass-panel / .tilt-glow element via main.js --- */
+.tilt-glow {
+    --mx: 50%;
+    --my: 50%;
+    position: relative;
+    transform-style: preserve-3d;
+    transition: transform 0.15s ease-out, box-shadow 0.25s ease-out;
+    will-change: transform;
+}
+.tilt-glow::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(circle at var(--mx) var(--my), rgba(139,92,246,0.25), transparent 60%);
+    opacity: 0;
+    transition: opacity 0.25s ease-out;
+    pointer-events: none;
+}
+.tilt-glow:hover::before { opacity: 1; }
+.tilt-glow:hover {
+    box-shadow: 0 12px 40px -8px rgba(139, 92, 246, 0.45), 0 0 0 1px rgba(208,188,255,0.15);
+}
+.tilt-glow.jump-pop {
+    animation: jump-pop 0.42s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes jump-pop {
+    0%   { transform: translateY(0) scale(1); }
+    35%  { transform: translateY(-8px) scale(1.03); }
+    100% { transform: translateY(0) scale(1); }
+}

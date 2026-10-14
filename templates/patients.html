@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Patients | DiaVision AI{% endblock %}
+{% block page_title %}Patients{% endblock %}
+
+{% block content %}
+<div class="flex justify-between items-center">
+  <h2 class="text-headline-lg font-headline-lg text-white">Patients</h2>
+  <a href="{{ url_for('analysis') }}" class="bg-primary text-on-primary px-6 py-2.5 rounded-xl font-semibold flex items-center gap-2 hover:opacity-90 transition-all">
+    <span class="material-symbols-outlined text-lg">add</span> Add via New Analysis
+  </a>
+</div>
+
+<form method="GET" class="flex items-center bg-white/5 px-4 py-2 rounded-full border border-white/10 max-w-md">
+  <span class="material-symbols-outlined text-on-surface-variant mr-2">search</span>
+  <input class="bg-transparent border-none focus:ring-0 text-body-md placeholder:text-on-surface-variant/50 w-full" name="q" value="{{ q }}" placeholder="Search patients or IDs...">
+</form>
+
+<div class="glass-card rounded-2xl overflow-hidden">
+  <table class="w-full text-left">
+    <thead class="bg-white/5 text-on-surface-variant text-label-sm uppercase tracking-wider">
+      <tr>
+        <th class="px-6 py-4">Name</th>
+        <th class="px-6 py-4">Patient ID</th>
+        <th class="px-6 py-4">Age</th>
+        <th class="px-6 py-4">Diabetes Type</th>
+        <th class="px-6 py-4">Screenings</th>
+        <th class="px-6 py-4">Latest Result</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-white/5">
+      {% for p in patients %}
+      <tr class="hover:bg-white/5 transition-colors cursor-pointer" onclick="window.location='{{ url_for('patient_profile', patient_id=p.id) }}'">
+        <td class="px-6 py-4 text-white font-semibold">{{ p.name }}</td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ p.patient_code }}</td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ p.age or '—' }}</td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ p.diabetes_type or '—' }}</td>
+        <td class="px-6 py-4 text-on-surface-variant">{{ p.total_screenings }}</td>
+        <td class="px-6 py-4">
+          {% if p.latest_analysis %}
+            <span class="px-3 py-1 rounded-full text-label-sm font-semibold border
+              {{ 'bg-secondary/10 text-secondary border-secondary/20' if p.latest_analysis.prediction_label=='No DR' else 'bg-error/10 text-error border-error/20' }}">
+              {{ p.latest_analysis.prediction_label }}
+            </span>
+          {% else %}
+            <span class="text-on-surface-variant text-label-sm">No screenings</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="px-6 py-10 text-center text-on-surface-variant">No patients found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

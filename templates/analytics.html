@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Analytics | DiaVision AI{% endblock %}
+{% block page_title %}Analytics{% endblock %}
+
+{% block content %}
+<h2 class="text-headline-lg font-headline-lg text-white">Analytics</h2>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-gutter">
+  <div class="glass-card rounded-2xl p-6 amethyst-glow">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Total Patients</p>
+    <h3 class="text-display-lg font-headline-lg text-white" style="font-size:36px;">{{ total_patients }}</h3>
+  </div>
+  <div class="glass-card rounded-2xl p-6">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Total Screenings</p>
+    <h3 class="text-display-lg font-headline-lg text-white" style="font-size:36px;">{{ total_analyses }}</h3>
+  </div>
+  <div class="glass-card rounded-2xl p-6">
+    <p class="text-on-surface-variant text-label-sm uppercase tracking-widest mb-2">Avg. Confidence</p>
+    <h3 class="text-display-lg font-headline-lg text-primary" style="font-size:36px;">{{ (avg_confidence*100)|round(1) }}%</h3>
+  </div>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-gutter">
+  <div class="glass-card rounded-2xl p-8">
+    <h4 class="text-headline-md font-headline-md text-white mb-6">Finding Distribution</h4>
+    <canvas id="distChart" height="260"></canvas>
+  </div>
+  <div class="glass-card rounded-2xl p-8">
+    <h4 class="text-headline-md font-headline-md text-white mb-6">Breakdown</h4>
+    <div class="space-y-5">
+      {% for label, count in counts.items() %}
+      <div class="space-y-2">
+        <div class="flex justify-between text-label-sm">
+          <span class="text-on-surface-variant">{{ label }}</span>
+          <span class="text-white font-semibold">{{ count }} ({{ ((count/total)*100)|round(1) }}%)</span>
+        </div>
+        <div class="relative h-3 w-full bg-black/40 rounded-lg overflow-hidden border border-white/5">
+          <div class="absolute inset-y-0 left-0 bg-primary" style="width:{{ ((count/total)*100)|round(1) }}%"></div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.3/chart.umd.min.js"></script>
+<script>
+  const ctx = document.getElementById('distChart');
+  new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: {{ counts.keys() | list | tojson }},
+      datasets: [{
+        data: {{ counts.values() | list | tojson }},
+        backgroundColor: ['#4edea3', '#d0bcff', '#a078ff', '#8B5CF6', '#ffb4ab'],
+        borderColor: '#000',
+        borderWidth: 3,
+      }]
+    },
+    options: {
+      plugins: { legend: { labels: { color: '#cbc3d7' } } },
+      cutout: '65%'
+    }
+  });
+</script>
+{% endblock %}

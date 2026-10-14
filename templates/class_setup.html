@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Class Setup | DiaVision AI{% endblock %}
+{% block page_title %}Class Setup{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto space-y-6">
+  <div class="glass-card rounded-2xl p-8">
+    <h3 class="text-headline-md font-headline-md text-white mb-2">Name the model's outputs</h3>
+    <p class="text-on-surface-variant text-label-sm leading-relaxed mb-2">
+      Your model has <b class="text-white">{{ n_out }}</b> outputs. Type what each one means, in the
+      <b class="text-white">same order the model was trained</b> (usually the alphabetical order of the
+      training folders). Tick the output that means <b class="text-white">not affected (healthy)</b>;
+      every other output is reported as <b class="text-white">Affected</b>.
+    </p>
+    <p class="text-on-surface-variant/70 text-label-sm leading-relaxed mb-6">
+      Earlier results are renamed automatically. Wrong order = wrong diagnosis, so check this carefully.
+    </p>
+
+    <form method="post" class="space-y-4">
+      <div class="bg-black/30 border border-white/5 rounded-xl p-4">
+        <label class="block text-[12px] font-mono text-on-surface-variant mb-2">Condition being screened</label>
+        <input type="text" name="condition" value="{{ condition }}" maxlength="80"
+               placeholder="e.g. Diabetic foot ulcer"
+               class="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-white focus:border-primary/60 outline-none">
+        <p class="text-label-sm text-on-surface-variant/60 mt-2">Used in the clinical wording of the result page and the PDF report.
+          Leave blank if you are not sure.</p>
+      </div>
+      {% for i in range(n_out) %}
+      <div class="flex flex-wrap items-center gap-4 bg-black/30 border border-white/5 rounded-xl p-4">
+        <span class="text-[12px] font-mono text-on-surface-variant w-16">Output {{ i }}</span>
+        <input type="text" name="name_{{ i }}" value="{{ names[i] }}" maxlength="40" required
+               placeholder="e.g. Healthy"
+               class="flex-1 min-w-[160px] bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-white focus:border-primary/60 outline-none">
+        <label class="flex items-center gap-2 text-label-sm text-on-surface-variant cursor-pointer">
+          <input type="checkbox" name="healthy_{{ i }}" {{ 'checked' if healthy[i] else '' }}>
+          Not affected (healthy)
+        </label>
+      </div>
+      {% endfor %}
+      <button type="submit"
+              class="w-full mt-2 py-3 rounded-xl bg-primary text-on-primary font-semibold hover:opacity-90 transition-all">
+        Save class setup
+      </button>
+    </form>
+  </div>
+</div>
+{% endblock %}

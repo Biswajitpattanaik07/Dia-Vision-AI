@@ -1,0 +1,1802 @@
+"""
+DiaVision AI — Flask application
+=================================
+Diabetic retinopathy screening dashboard backed by your trained Keras
+model at models/best_model.keras.
+
+IMPORTANT — before running:
+1.  Drop your trained model at:  models/best_model.keras
+2.  Edit CLASS_NAMES below so it EXACTLY matches your model's output
+    order (index 0 = first class your model predicts, etc). Get this
+    wrong and predictions will map to the wrong label even though the
+    model itself is correct.
+
+Run:
+    python -m pip install -r requirements.txt
+    python app.py
+Then open http://127.0.0.1:5000
+Demo login: doctor@diavision.ai / password123
+"""
+import json
+import os
+from datetime import datetime
+
+from flask import (Flask, render_template, redirect, url_for, request,
+                    flash, send_from_directory, jsonify)
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import (LoginManager, UserMixin, login_user, logout_user,
+                          login_required, current_user)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # loads TURSO_DATABASE_URL, GROK_API_KEY, etc. from a local .env file
+except ImportError:
+    pass  # python-dotenv not installed — env vars can still be set directly on the OS
+
+# ---------------------------------------------------------------------------
+# App / config
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+REPORTS_FOLDER = os.path.join(BASE_DIR, "reports")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model.keras")
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp"}
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(REPORTS_FOLDER, exist_ok=True)
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["REPORTS_FOLDER"] = REPORTS_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB uploads
+
+# --- Database: Turso (libSQL) if configured, otherwise local SQLite -------
+# Set TURSO_DATABASE_URL (e.g. "libsql://your-db-org.turso.io") and
+# TURSO_AUTH_TOKEN in a .env file (see .env.example) to use Turso.
+# Requires: pip install sqlalchemy-libsql
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+USING_TURSO = False
+
+
+def _turso_connection_works(uri):
+    """Quick pre-flight connectivity check. Without this, a wrong token,
+    a typo'd hostname, or Turso being temporarily unreachable would crash
+    the entire app at startup with a raw traceback the first time a route
+    touches the database — instead we test once up front and fall back
+    to local SQLite with a clear message if it fails."""
+    try:
+        from sqlalchemy import create_engine, text
+        test_engine = create_engine(uri)
+        with test_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        test_engine.dispose()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+    try:
+        import sqlalchemy_libsql  # noqa: F401  (registers the sqlite+libsql dialect)
+        turso_uri = TURSO_DATABASE_URL.replace("libsql://", "sqlite+libsql://")
+        sep = "&" if "?" in turso_uri else "?"
+        turso_uri = f"{turso_uri}{sep}authToken={TURSO_AUTH_TOKEN}&secure=true"
+
+        ok, err = _turso_connection_works(turso_uri)
+        if ok:
+            app.config["SQLALCHEMY_DATABASE_URI"] = turso_uri
+            USING_TURSO = True
+            print(f"[DiaVision] Using Turso database: {TURSO_DATABASE_URL}")
+        else:
+            print(f"[DiaVision] Could not connect to Turso ({err}). Falling back to local SQLite. "
+                  f"Check TURSO_DATABASE_URL / TURSO_AUTH_TOKEN in .env, and your network egress "
+                  f"settings if you're behind a firewall.")
+    except ImportError:
+        print("[DiaVision] TURSO_DATABASE_URL is set but 'sqlalchemy-libsql' isn't installed "
+              "(pip install sqlalchemy-libsql). Falling back to local SQLite.")
+
+if not USING_TURSO:
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "diavision.db")
+    print("[DiaVision] Using local SQLite database (diavision.db)")
+
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+login_manager.login_message_category = "warning"
+
+# ---------------------------------------------------------------------------
+# >>> EDIT THIS to match your model's output classes, in order. <<<
+# Index 0 must be whatever class your model puts first in its output
+# vector, index 1 the second, etc. If unsure, check how you set up your
+# training generator / dataset — the class order it used is the order
+# your model predicts in.
+# ---------------------------------------------------------------------------
+CLASS_NAMES = ["No DR", "Mild DR", "Moderate DR", "Severe DR", "Proliferative DR"]
+
+# Optional: instead of editing the list above, you can drop a
+# models/class_names.json file (a JSON list of strings, in model output
+# order) and it will be used automatically instead.
+CLASS_NAMES_PATH = os.path.join(BASE_DIR, "models", "class_names.json")
+if os.path.exists(CLASS_NAMES_PATH):
+    with open(CLASS_NAMES_PATH) as f:
+        CLASS_NAMES = json.load(f)
+
+
+# Which class names mean "NOT affected" (healthy / normal). Set in .env as a
+# comma-separated list, e.g.  NOT_AFFECTED_CLASSES=Healthy,Normal
+# Every other class is reported as "Affected". Leave empty if you don't know yet.
+NOT_AFFECTED_CLASSES = [x.strip().lower()
+                        for x in os.environ.get("NOT_AFFECTED_CLASSES", "").split(",") if x.strip()]
+
+
+def verdict_for(label):
+    """Returns 'Affected', 'Not affected', or None when it isn't configured."""
+    if not NOT_AFFECTED_CLASSES:
+        return None
+    return "Not affected" if (label or "").strip().lower() in NOT_AFFECTED_CLASSES else "Affected"
+
+
+# Name of the condition being screened, used in the clinical wording of the result page and
+# report (e.g. "Diabetic foot ulcer"). Set it on the Class Setup page, or CONDITION_NAME in .env.
+CONDITION_NAME = os.environ.get("CONDITION_NAME", "").strip()
+
+# Class setup saved from the in-app page (/settings/classes). Overrides the lists above.
+CLASS_CONFIG_PATH = os.path.join(BASE_DIR, "models", "class_config.json")
+if os.path.exists(CLASS_CONFIG_PATH):
+    try:
+        with open(CLASS_CONFIG_PATH, encoding="utf-8") as _f:
+            _cfg = json.load(_f)
+        if isinstance(_cfg.get("names"), list) and _cfg["names"]:
+            CLASS_NAMES = [str(n) for n in _cfg["names"]]
+        if str(_cfg.get("condition", "")).strip():
+            CONDITION_NAME = str(_cfg["condition"]).strip()
+        for _n in _cfg.get("not_affected", []):
+            if str(_n).strip().lower() not in NOT_AFFECTED_CLASSES:
+                NOT_AFFECTED_CLASSES.append(str(_n).strip().lower())
+    except Exception as _exc:
+        print(f"[DiaVision] Could not read {CLASS_CONFIG_PATH}: {_exc}")
+
+
+# Preprocessing mode: must match how the model was trained.
+#   "raw"   -> pixels stay 0-255 (correct for your EfficientNet model)
+#   "scale" -> pixels / 255
+PREPROCESS_MODE = os.environ.get("PREPROCESS_MODE", "raw").strip().lower()
+
+# ---------------------------------------------------------------------------
+# Database models
+# ---------------------------------------------------------------------------
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    role = db.Column(db.String(60), default="Clinician")
+    password_hash = db.Column(db.String(255), nullable=False)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Patient(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    patient_code = db.Column(db.String(40), unique=True, nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    age = db.Column(db.Integer)
+    gender = db.Column(db.String(30))
+    diabetes_type = db.Column(db.String(30))
+    duration_years = db.Column(db.Float)
+    city = db.Column(db.String(120))
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    analyses = db.relationship("Analysis", backref="patient", lazy=True,
+                                order_by="desc(Analysis.created_at)")
+
+    @property
+    def total_screenings(self):
+        return len(self.analyses)
+
+    @property
+    def latest_analysis(self):
+        return self.analyses[0] if self.analyses else None
+
+
+class Analysis(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey("patient.id"), nullable=False)
+    image_filename = db.Column(db.String(255), nullable=False)
+    prediction_label = db.Column(db.String(60), nullable=False)
+    confidence = db.Column(db.Float, nullable=False)
+    probabilities_json = db.Column(db.Text, nullable=False)  # JSON: {label: prob}
+    reviewed_by = db.Column(db.String(120))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # Grad-CAM: filename of the generated heatmap overlay, if it could be
+    # produced. gradcam_error holds a human-readable technical reason if
+    # generation failed — the prediction itself still succeeds either way.
+    gradcam_filename = db.Column(db.String(255))
+    gradcam_error = db.Column(db.Text)
+
+    @property
+    def probabilities(self):
+        return json.loads(self.probabilities_json)
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# ---------------------------------------------------------------------------
+# Model loading — loaded ONCE at startup, for real. If this fails, the
+# app still starts (so you can see the dashboard etc.) but every analysis
+# attempt will show a clear error telling you exactly what's wrong,
+# instead of silently guessing.
+# ---------------------------------------------------------------------------
+MODEL = None
+MODEL_LOAD_ERROR = None
+
+try:
+    import tensorflow as tf
+    if not os.path.exists(MODEL_PATH):
+        MODEL_LOAD_ERROR = (
+            f"No model file found at {MODEL_PATH}. "
+            f"Copy your trained model there as 'best_model.keras'."
+        )
+    else:
+        MODEL = tf.keras.models.load_model(MODEL_PATH)
+        print(f"[DiaVision] Loaded model from {MODEL_PATH}")
+        print(f"[DiaVision] Model input shape: {MODEL.input_shape}")
+        print(f"[DiaVision] Model output units: {MODEL.output_shape}")
+        print("[DiaVision] Explanation code version: v18")
+        print(f"[DiaVision] Preprocess mode: {PREPROCESS_MODE}")
+        print("[DiaVision] Model layers:")
+        for _i, _l in enumerate(MODEL.layers):
+            print(f"    {_i:>3}  {_l.name}  ({type(_l).__name__})")
+        if MODEL.output_shape[-1] != len(CLASS_NAMES):
+            _n_out = MODEL.output_shape[-1]
+            print(
+                f"[DiaVision] WARNING: model outputs {_n_out} classes "
+                f"but CLASS_NAMES has {len(CLASS_NAMES)} entries. Using neutral labels "
+                f"'Class 0..{_n_out - 1}' so no made-up diagnosis is shown. "
+                f"Create models/class_names.json with the real names to fix this."
+            )
+            CLASS_NAMES = [f"Class {_i}" for _i in range(_n_out)]
+except ImportError:
+    MODEL_LOAD_ERROR = (
+        "TensorFlow isn't installed. Run: python -m pip install tensorflow"
+    )
+except Exception as exc:
+    MODEL_LOAD_ERROR = f"Failed to load model from {MODEL_PATH}: {exc}"
+
+if MODEL_LOAD_ERROR:
+    print(f"[DiaVision] MODEL NOT LOADED — {MODEL_LOAD_ERROR}")
+
+
+# ---------------------------------------------------------------------------
+# >>> PREPROCESSING — must match how the model was TRAINED. <<<
+#   "raw"   : pixels stay 0-255 (use for EfficientNet/ResNet-style models that
+#             have their own scaling built in, or were trained on raw pixels)
+#   "scale" : pixels divided by 255 -> 0-1 (use if you trained with rescale=1/255)
+# If Grad-CAM lights up the image corners/background, try the other option.
+# ---------------------------------------------------------------------------
+def preprocess_pil(pil_img, target_size):
+    """PIL image -> float32 array of shape (1, H, W, 3), preprocessed the same
+    way for both prediction and Grad-CAM so they always agree."""
+    import numpy as np
+    img = pil_img.convert("RGB").resize((target_size[1], target_size[0]))
+    arr = np.array(img).astype("float32")
+    if PREPROCESS_MODE == "scale":
+        arr = arr / 255.0
+    return np.expand_dims(arr, axis=0)
+
+
+def run_inference(image_path):
+    """Returns (label, confidence, probabilities_dict). Raises RuntimeError
+    with a clear message if the model isn't loaded — callers must handle
+    this and show it to the user instead of guessing a fake result."""
+    if MODEL is None:
+        raise RuntimeError(MODEL_LOAD_ERROR or "Model is not loaded.")
+
+    import numpy as np
+    from PIL import Image
+
+    target_size = MODEL.input_shape[1:3]  # (height, width) from the model itself
+    arr = preprocess_pil(Image.open(image_path), target_size)
+
+    preds = MODEL.predict(arr, verbose=0)[0]
+
+    n = min(len(CLASS_NAMES), len(preds))
+    probs = {CLASS_NAMES[i]: float(preds[i]) for i in range(n)}
+    idx = int(np.argmax(preds[:n]))
+    return CLASS_NAMES[idx], float(preds[idx]), probs
+
+
+def _jet_colormap(gray):
+    """gray: HxW float array in [0,1]. Returns HxWx3 uint8 approximating a
+    'jet' colormap (blue -> green -> yellow -> red), without needing
+    matplotlib as a dependency."""
+    import numpy as np
+    r = np.clip(1.5 - np.abs(4 * gray - 3), 0, 1)
+    g = np.clip(1.5 - np.abs(4 * gray - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(4 * gray - 1), 0, 1)
+    return np.uint8(255 * np.stack([r, g, b], axis=-1))
+
+
+def _layer_output_shape(layer):
+    """Returns a layer's output shape as a tuple, or None if unavailable.
+    Keras 2 exposes layer.output_shape directly; Keras 3 removed that in
+    favor of layer.output.shape — this works with either."""
+    try:
+        shape = layer.output_shape
+    except AttributeError:
+        try:
+            shape = tuple(layer.output.shape)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if isinstance(shape, list):
+        shape = shape[0] if shape else None
+    return shape
+
+
+def _find_last_conv_layer(model):
+    """Finds the last layer with a 4D output (typically the last Conv2D
+    layer, or a pretrained base model whose output is a 4D feature map) —
+    Grad-CAM needs this. Raises if none exists (e.g. a non-convolutional
+    model), which callers must handle."""
+    for layer in reversed(model.layers):
+        shape = _layer_output_shape(layer)
+        if shape is not None and len(shape) == 4:
+            return layer
+    raise RuntimeError(
+        "No convolutional layer found in this model — Grad-CAM requires a "
+        "CNN with at least one Conv2D-style layer."
+    )
+
+
+def _pick_gradcam_layer(model):
+    """Layer whose feature map Grad-CAM uses. By default: the last 4D layer.
+    Set GRADCAM_LAYER=<layer name> in .env to try a different one (an EARLIER
+    layer gives a sharper, higher-resolution heatmap)."""
+    name = os.environ.get("GRADCAM_LAYER", "").strip()
+    if name:
+        return model.get_layer(name)
+    return _find_last_conv_layer(model)
+
+
+def _find_nested_base(model):
+    """Returns the first top-level layer that is itself a Model (e.g. a
+    pretrained EfficientNet/DenseNet base), or None if the model is flat."""
+    for layer in model.layers:
+        if getattr(layer, "layers", None):
+            return layer
+    return None
+
+
+def _gradient_heatmap_legacy(arr, class_idx):
+    """Classic Grad-CAM. Returns a small 2D heatmap (feature-map resolution).
+    arr: tf tensor (1,H,W,3)."""
+    import tensorflow as tf
+
+    conv_outputs, grads = None, None
+    errors = []
+
+    # Method A: sub-model from the model's own graph (flat models)
+    try:
+        last_conv_layer = _pick_gradcam_layer(MODEL)
+        print(f"[DiaVision] Grad-CAM using layer: {last_conv_layer.name}")
+        # Preferred: gradient of the raw pre-softmax score (softmax saturates
+        # when the model is confident, which kills the gradient).
+        try:
+            head = MODEL.layers[-1]
+            act_name = getattr(getattr(head, "activation", None), "__name__", "")
+            if hasattr(head, "kernel") and act_name in ("softmax", "sigmoid"):
+                logit_model = tf.keras.models.Model(
+                    inputs=MODEL.inputs,
+                    outputs=[last_conv_layer.output, head.input],
+                )
+                with tf.GradientTape() as tape:
+                    conv_outputs, feats = logit_model(arr, training=False)
+                    if isinstance(feats, (list, tuple)):
+                        feats = feats[0]
+                    logits = tf.matmul(feats, head.kernel)
+                    if getattr(head, "use_bias", False):
+                        logits = logits + head.bias
+                    loss = logits[:, class_idx]
+                grads = tape.gradient(loss, conv_outputs)
+        except Exception as exc:
+            errors.append(f"A-logits: {exc}")
+            conv_outputs, grads = None, None
+
+        if grads is None:
+            grad_model = tf.keras.models.Model(
+                inputs=MODEL.inputs,
+                outputs=[last_conv_layer.output, MODEL.output],
+            )
+            with tf.GradientTape() as tape:
+                conv_outputs, preds = grad_model(arr, training=False)
+                if isinstance(preds, (list, tuple)):
+                    preds = preds[0]
+                loss = preds[:, class_idx]
+            grads = tape.gradient(loss, conv_outputs)
+    except Exception as exc:
+        errors.append(f"A: {exc}")
+        conv_outputs, grads = None, None
+
+    # Method B: nested base model + classifier head
+    if grads is None:
+        try:
+            base = _find_nested_base(MODEL)
+            if base is None:
+                raise RuntimeError("model has no nested base model")
+            inner_conv = _find_last_conv_layer(base)
+            inner_model = tf.keras.models.Model(
+                inputs=base.inputs,
+                outputs=[inner_conv.output, base.output],
+            )
+            with tf.GradientTape() as tape:
+                x = arr
+                conv_outputs = None
+                for layer in MODEL.layers:
+                    if isinstance(layer, tf.keras.layers.InputLayer):
+                        continue
+                    if layer is base:
+                        conv_outputs, x = inner_model(x, training=False)
+                    else:
+                        x = layer(x)
+                preds = x[0] if isinstance(x, (list, tuple)) else x
+                loss = preds[:, class_idx]
+            grads = tape.gradient(loss, conv_outputs)
+        except Exception as exc:
+            errors.append(f"B: {exc}")
+            conv_outputs, grads = None, None
+
+    if grads is None or conv_outputs is None:
+        raise RuntimeError("[v7] Grad-CAM failed. " + " | ".join(errors))
+
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap = conv_outputs[0] @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+    heatmap = heatmap.numpy()
+
+    # Edge-artifact trim (outer ring of the small feature map)
+    trim = int(os.environ.get("GRADCAM_EDGE_TRIM", "1"))
+    if trim > 0 and min(heatmap.shape) > 2 * trim + 2:
+        heatmap[:trim, :] = 0
+        heatmap[-trim:, :] = 0
+        heatmap[:, :trim] = 0
+        heatmap[:, -trim:] = 0
+    return heatmap
+
+
+def _cam_fn_for_layer(layer, plus=False):
+    """Builds a function arr(tf tensor) -> 2D CAM (feature-map resolution) for one
+    layer. Uses the raw pre-softmax score when the last layer is softmax/sigmoid
+    (softmax saturates and kills gradients). plus=True uses Grad-CAM++ weights."""
+    import numpy as np
+    import tensorflow as tf
+
+    head = MODEL.layers[-1]
+    act_name = getattr(getattr(head, "activation", None), "__name__", "")
+    use_logits = hasattr(head, "kernel") and act_name in ("softmax", "sigmoid")
+    second = head.input if use_logits else MODEL.output
+    gm = tf.keras.models.Model(MODEL.inputs, [layer.output, second])
+
+    def fn(arr, class_idx):
+        with tf.GradientTape() as tape:
+            conv, out = gm(arr, training=False)
+            if isinstance(out, (list, tuple)):
+                out = out[0]
+            if use_logits:
+                out = tf.matmul(out, head.kernel)
+                if getattr(head, "use_bias", False):
+                    out = out + head.bias
+            score = out[:, class_idx]
+        grads = tape.gradient(score, conv)
+        if grads is None:
+            raise RuntimeError(f"no gradients for layer {layer.name}")
+        conv = conv[0].numpy()
+        grads = grads[0].numpy()
+        if plus:  # Grad-CAM++ weighting
+            g2 = grads ** 2
+            g3 = g2 * grads
+            denom = 2 * g2 + conv.sum(axis=(0, 1), keepdims=True) * g3
+            denom = np.where(denom != 0, denom, 1e-8)
+            weights = ((g2 / denom) * np.maximum(grads, 0)).sum(axis=(0, 1))
+        else:
+            weights = grads.mean(axis=(0, 1))
+        return np.maximum((conv * weights).sum(axis=-1), 0)
+
+    return fn
+
+
+def _tta_cam(fn, arr_np, class_idx):
+    """Averages the CAM over the original + horizontally + vertically flipped
+    image (flips are undone before averaging). Reduces noise and makes the
+    heatmap more stable."""
+    import numpy as np
+    import tensorflow as tf
+    cams = []
+    for flip in (None, 2, 1):                      # none, horizontal, vertical
+        a = arr_np if flip is None else np.ascontiguousarray(np.flip(arr_np, axis=flip))
+        cam = fn(tf.convert_to_tensor(a), class_idx)
+        if flip is not None:
+            cam = np.flip(cam, axis=flip - 1)      # undo the flip on the CAM
+        cams.append(cam / (cam.max() + 1e-8))
+    cam = np.mean(cams, axis=0)
+    return cam / (cam.max() + 1e-8)
+
+
+def _pick_fine_layer(coarse_layer):
+    """A higher-resolution layer to sharpen the heatmap. GRADCAM_FINE_LAYER in
+    .env overrides; default is block5f_add (EfficientNet), else the last
+    Activation/Add layer that has at least twice the coarse resolution."""
+    name = os.environ.get("GRADCAM_FINE_LAYER", "block5f_add").strip()
+    try:
+        if name and name.lower() != "none":
+            return MODEL.get_layer(name)
+    except Exception:
+        pass
+    if name.lower() == "none":
+        return None
+    coarse_h = (_layer_output_shape(coarse_layer) or (None, 0))[1] or 0
+    for layer in reversed(MODEL.layers):
+        shape = _layer_output_shape(layer)
+        if (shape is not None and len(shape) == 4 and shape[1] and shape[1] >= 2 * coarse_h
+                and type(layer).__name__ in ("Activation", "Add")):
+            return layer
+    return None
+
+
+def _gradient_heatmap(arr_np, class_idx):
+    """Sharper Grad-CAM: fuses a coarse (last layer) and a fine (earlier layer)
+    CAM with a geometric mean, so only regions supported by BOTH stay lit, and
+    averages over image flips. Falls back to the plain method on any problem.
+    arr_np: numpy (1,H,W,3)."""
+    import numpy as np
+    import tensorflow as tf
+    from PIL import Image
+
+    try:
+        plus = os.environ.get("GRADCAM_PLUS", "0").strip() == "1"
+        coarse_layer = _pick_gradcam_layer(MODEL)
+        coarse = _tta_cam(_cam_fn_for_layer(coarse_layer, plus), arr_np, class_idx)
+        trim = int(os.environ.get("GRADCAM_EDGE_TRIM", "1"))
+        if trim > 0 and min(coarse.shape) > 2 * trim + 2:
+            coarse[:trim, :] = 0; coarse[-trim:, :] = 0
+            coarse[:, :trim] = 0; coarse[:, -trim:] = 0
+            coarse = coarse / (coarse.max() + 1e-8)
+
+        fine_layer = _pick_fine_layer(coarse_layer)
+        if fine_layer is None or os.environ.get("GRADCAM_FUSE", "1").strip() == "0":
+            print(f"[DiaVision] Heatmap: layer {coarse_layer.name} (no fusion)")
+            return coarse
+
+        fine = _tta_cam(_cam_fn_for_layer(fine_layer, plus), arr_np, class_idx)
+        if trim > 0 and min(fine.shape) > 2 * trim + 2:
+            fine[:trim, :] = 0; fine[-trim:, :] = 0
+            fine[:, :trim] = 0; fine[:, -trim:] = 0
+            fine = fine / (fine.max() + 1e-8)
+
+        coarse_up = np.array(Image.fromarray(np.uint8(255 * coarse)).resize(
+            (fine.shape[1], fine.shape[0]), Image.BICUBIC)).astype("float32") / 255.0
+        fused = np.sqrt(np.clip(coarse_up, 0, 1) * np.clip(fine, 0, 1))
+        print(f"[DiaVision] Heatmap: fused {coarse_layer.name} + {fine_layer.name}"
+              f"{' (Grad-CAM++)' if plus else ''}, flip-averaged")
+        return fused / (fused.max() + 1e-8)
+    except Exception as exc:
+        print(f"[DiaVision] Sharper heatmap failed ({exc}); using the plain method.")
+        return _gradient_heatmap_legacy(tf.convert_to_tensor(arr_np), class_idx)
+
+
+def _occlusion_heatmap(arr_np, class_idx, grid=6):
+    """Occlusion sensitivity: slide a gray patch over the image and measure how
+    much the model's confidence in class_idx drops. Gradient-free, so it is not
+    affected by padding/saturation artifacts. Returns an HxW heatmap."""
+    import numpy as np
+
+    _, H, W, _ = arr_np.shape
+    ph, pw = max(H // 4, 1), max(W // 4, 1)          # patch = 1/4 of the image
+    ys = np.linspace(0, H - ph, grid).astype(int)
+    xs = np.linspace(0, W - pw, grid).astype(int)
+    fill = arr_np.mean(axis=(1, 2), keepdims=True)    # neutral mean-colour patch
+
+    batch = []
+    for y in ys:
+        for x in xs:
+            a = arr_np.copy()
+            a[:, y:y + ph, x:x + pw, :] = fill
+            batch.append(a[0])
+    batch = np.stack(batch)
+
+    base = float(MODEL.predict(arr_np, verbose=0)[0][class_idx])
+    probs = MODEL.predict(batch, batch_size=16, verbose=0)[:, class_idx]
+    # drop in log-probability: stays sensitive even when the model is ~100% sure
+    drops = np.maximum(np.log(base + 1e-7) - np.log(probs + 1e-7), 0)
+
+    heat = np.zeros((H, W), dtype="float32")
+    cnt = np.zeros((H, W), dtype="float32")
+    i = 0
+    for y in ys:
+        for x in xs:
+            heat[y:y + ph, x:x + pw] += drops[i]
+            cnt[y:y + ph, x:x + pw] += 1
+            i += 1
+    heat = heat / np.maximum(cnt, 1)
+    return heat
+
+
+def _render_overlay(original, heatmap):
+    """Blends a small 2D heatmap (values 0-1) onto the original PIL image.
+    Cleans it up so the picture isn't noisy: smooth, drop weak areas, keep it
+    on the subject. Returns a uint8 RGB array."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    # 1) upsample to the original size, then smooth so it looks like soft blobs
+    heat_img = Image.fromarray(np.uint8(255 * np.clip(heatmap, 0, 1))).resize(original.size, resample=Image.BICUBIC)
+    radius = max(2, min(original.size) // 45)
+    heat_img = heat_img.filter(ImageFilter.GaussianBlur(radius))
+    heat = np.array(heat_img).astype("float32") / 255.0
+
+    # 2) keep the heatmap on the subject (ignore pure-black background)
+    gray = np.array(original).astype("float32").mean(axis=2)
+    mask_img = Image.fromarray(np.uint8((gray > 20) * 255)).filter(ImageFilter.MaxFilter(5))
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(3))
+    heat = heat * (np.array(mask_img).astype("float32") / 255.0)
+
+    # 3) normalise using the 99.5th percentile (single spikes can't dominate),
+    #    then drop weak areas so only the strongest regions are coloured
+    hi = np.percentile(heat, 99.5)
+    if hi > 0:
+        heat = np.clip(heat / hi, 0, 1)
+    cutoff = float(os.environ.get("GRADCAM_THRESHOLD", "0.35"))
+    heat = np.clip((heat - cutoff) / (1 - cutoff), 0, 1)
+
+    # 4) blend: strong areas get colour, everything else stays the original photo
+    colored = _jet_colormap(heat).astype("float32")
+    original_arr = np.array(original).astype("float32")
+    alpha = (0.7 * heat)[..., None]
+    return np.clip(original_arr * (1 - alpha) + colored * alpha, 0, 255).astype("uint8")
+
+
+def generate_gradcam(image_path, class_idx):
+    """Builds an explanation heatmap overlay for the given image and predicted
+    class index, saves it next to the original upload, and returns the saved
+    filename. Raises RuntimeError with a clear message on failure (callers
+    catch it and show it on the result page).
+
+    Method is chosen by GRADCAM_METHOD in .env:
+        gradcam (default)   - classic Grad-CAM, fast
+        occlusion           - gradient-free, slower; use if Grad-CAM shows edge artifacts"""
+    if MODEL is None:
+        raise RuntimeError("Model is not loaded.")
+
+    import numpy as np
+    import tensorflow as tf
+    from PIL import Image, ImageFilter
+
+    method = os.environ.get("GRADCAM_METHOD", "gradcam").strip().lower()
+    target_size = MODEL.input_shape[1:3]
+    original = Image.open(image_path).convert("RGB")
+    arr_np = preprocess_pil(original, target_size)
+
+    try:
+        if method == "gradcam":
+            heatmap = _gradient_heatmap(arr_np, class_idx)
+        else:
+            heatmap = _occlusion_heatmap(arr_np, class_idx)
+    except Exception as exc:
+        raise RuntimeError(f"[v7:{method}] {exc}")
+
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+
+    overlay = _render_overlay(original, heatmap)
+
+    gradcam_filename = f"gradcam_{os.path.splitext(os.path.basename(image_path))[0]}.png"
+    Image.fromarray(overlay).save(os.path.join(UPLOAD_FOLDER, gradcam_filename))
+    return gradcam_filename
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        user = User.query.filter_by(email=email).first()
+        if user and user.check_password(password):
+            login_user(user, remember=bool(request.form.get("remember")))
+            return redirect(request.args.get("next") or url_for("dashboard"))
+        flash("Invalid email or password.", "error")
+    return render_template("login.html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        role = request.form.get("role", "").strip() or "Clinician"
+        password = request.form.get("password", "")
+        confirm = request.form.get("confirm_password", "")
+
+        if not name or not email or not password:
+            flash("Please fill in all required fields.", "error")
+        elif password != confirm:
+            flash("Passwords do not match.", "error")
+        elif len(password) < 8:
+            flash("Password must be at least 8 characters.", "error")
+        elif User.query.filter_by(email=email).first():
+            flash("An account with that email already exists.", "error")
+        else:
+            user = User(name=name, email=email, role=role)
+            user.set_password(password)
+            db.session.add(user)
+            db.session.commit()
+            login_user(user)
+            flash("Account created — welcome to DiaVision AI.", "success")
+            return redirect(url_for("dashboard"))
+    return render_template("register.html")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Core pages
+# ---------------------------------------------------------------------------
+@app.route("/")
+def index():
+    return redirect(url_for("dashboard") if current_user.is_authenticated else url_for("login"))
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    total_patients = Patient.query.count()
+    total_analyses = Analysis.query.count()
+    recent_analyses = Analysis.query.order_by(Analysis.created_at.desc()).limit(5).all()
+    recent_patients = Patient.query.order_by(Patient.created_at.desc()).limit(5).all()
+    if NOT_AFFECTED_CLASSES:
+        flagged = Analysis.query.filter(
+            ~db.func.lower(Analysis.prediction_label).in_(NOT_AFFECTED_CLASSES)).count()
+    elif "No DR" in CLASS_NAMES:
+        flagged = Analysis.query.filter(Analysis.prediction_label != "No DR").count()
+    else:
+        flagged = 0  # unknown which classes mean "affected" until configured
+    return render_template(
+        "dashboard.html",
+        total_patients=total_patients,
+        total_analyses=total_analyses,
+        flagged=flagged,
+        recent_analyses=recent_analyses,
+        recent_patients=recent_patients,
+        model_loaded=(MODEL is not None),
+        model_error=MODEL_LOAD_ERROR,
+    )
+
+
+@app.route("/analysis", methods=["GET", "POST"])
+@login_required
+def analysis():
+    patients = Patient.query.order_by(Patient.name).all()
+
+    if request.method == "POST":
+        if MODEL is None:
+            flash(f"Cannot run analysis — model not loaded: {MODEL_LOAD_ERROR}", "error")
+            return redirect(url_for("analysis"))
+
+        patient_id = request.form.get("patient_id")
+
+        if patient_id == "new":
+            code = request.form.get("patient_code") or f"PX-{int(datetime.utcnow().timestamp())}"
+            if Patient.query.filter_by(patient_code=code).first():
+                flash("That Patient ID already exists.", "error")
+                return redirect(url_for("analysis"))
+            patient = Patient(
+                patient_code=code,
+                name=request.form.get("name", "Unnamed Patient"),
+                age=request.form.get("age") or None,
+                gender=request.form.get("gender"),
+                diabetes_type=request.form.get("diabetes_type"),
+                duration_years=request.form.get("duration_years") or None,
+                city=request.form.get("city"),
+                notes=request.form.get("notes"),
+            )
+            db.session.add(patient)
+            db.session.commit()
+        else:
+            patient = Patient.query.get(int(patient_id))
+            if not patient:
+                flash("Please select a valid patient.", "error")
+                return redirect(url_for("analysis"))
+
+        file = request.files.get("image")
+        if not file or file.filename == "":
+            flash("Please attach a retinal image to analyze.", "error")
+            return redirect(url_for("analysis"))
+        if not allowed_file(file.filename):
+            flash("Unsupported file type.", "error")
+            return redirect(url_for("analysis"))
+
+        filename = secure_filename(f"{patient.patient_code}_{int(datetime.utcnow().timestamp())}_{file.filename}")
+        save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        file.save(save_path)
+
+        try:
+            label, confidence, probs = run_inference(save_path)
+        except Exception as exc:
+            flash(f"Analysis failed: {exc}", "error")
+            return redirect(url_for("analysis"))
+
+        # Grad-CAM is best-effort: if it fails for any reason (unsupported
+        # architecture, gradient issue, etc.) we still keep the prediction
+        # and show a clear technical-issue notice on the result page
+        # instead of losing the analysis or crashing.
+        gradcam_filename = None
+        gradcam_error = None
+        try:
+            class_idx = CLASS_NAMES.index(label)
+            gradcam_filename = generate_gradcam(save_path, class_idx)
+        except Exception as exc:
+            gradcam_error = str(exc)
+            app.logger.warning("Grad-CAM generation failed: %s", exc)
+
+        record = Analysis(
+            patient_id=patient.id,
+            image_filename=filename,
+            prediction_label=label,
+            confidence=confidence,
+            probabilities_json=json.dumps(probs),
+            reviewed_by=current_user.name,
+            gradcam_filename=gradcam_filename,
+            gradcam_error=gradcam_error,
+        )
+        db.session.add(record)
+        db.session.commit()
+
+        return redirect(url_for("result", analysis_id=record.id))
+
+    return render_template("analysis.html", patients=patients, model_loaded=(MODEL is not None), model_error=MODEL_LOAD_ERROR)
+
+
+@app.route("/result/<int:analysis_id>")
+@login_required
+def result(analysis_id):
+    record = Analysis.query.get_or_404(analysis_id)
+    sorted_probs = sorted(record.probabilities.items(), key=lambda kv: kv[1], reverse=True)
+    return render_template("result.html", record=record, patient=record.patient, sorted_probs=sorted_probs,
+                           verdict=verdict_for(record.prediction_label),
+                           summary=clinical_summary(record))
+
+
+# ---------------------------------------------------------------------------
+# Patients
+# ---------------------------------------------------------------------------
+@app.route("/patients")
+@login_required
+def patients():
+    q = request.args.get("q", "").strip()
+    query = Patient.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(db.or_(Patient.name.ilike(like), Patient.patient_code.ilike(like)))
+    all_patients = query.order_by(Patient.created_at.desc()).all()
+    return render_template("patients.html", patients=all_patients, q=q)
+
+
+@app.route("/patients/<int:patient_id>")
+@login_required
+def patient_profile(patient_id):
+    patient = Patient.query.get_or_404(patient_id)
+    return render_template("patient_profile.html", patient=patient)
+
+
+# ---------------------------------------------------------------------------
+# History / Reports / Analytics
+# ---------------------------------------------------------------------------
+@app.route("/history")
+@login_required
+def history():
+    filter_label = request.args.get("label", "")
+    query = Analysis.query
+    if filter_label:
+        query = query.filter_by(prediction_label=filter_label)
+    records = query.order_by(Analysis.created_at.desc()).all()
+    return render_template("history.html", records=records, class_names=CLASS_NAMES, filter_label=filter_label)
+
+
+@app.route("/reports")
+@login_required
+def reports():
+    records = Analysis.query.order_by(Analysis.created_at.desc()).all()
+    return render_template("reports.html", records=records)
+
+
+def _condition_kind(cond):
+    """Rough category of the configured condition, used to pick suitable
+    follow-up wording: 'foot', 'eye' or 'generic'."""
+    import re
+    c = (cond or "").lower()
+    if re.search(r"foot|ulcer|wound|dfu", c):
+        return "foot"
+    if re.search(r"retinopath|\bdr\b|fundus|retina|eye", c):
+        return "eye"
+    return "generic"
+
+
+def clinical_summary(record):
+    """Clinical wording for one analysis, shared by the result page and the PDF.
+    Never states a specific diagnosis the app does not know: it uses the
+    configured condition name, or 'the target condition' if none is set."""
+    cond = CONDITION_NAME or "the target condition"
+    label = record.prediction_label
+    outcome = verdict_for(label)
+    conf = record.confidence * 100
+    conf_txt = f"{conf:.1f}%"
+    level = "high" if conf >= 85 else ("moderate" if conf >= 60 else "low")
+    kind = _condition_kind(CONDITION_NAME)
+    ranked = sorted(record.probabilities.items(), key=lambda kv: kv[1], reverse=True)
+    runner = ranked[1] if len(ranked) > 1 else None
+    runner_txt = (f" The next most likely category was '{runner[0]}' ({runner[1] * 100:.1f}%)."
+                  if runner else "")
+
+    if outcome == "Affected":
+        headline = "SCREEN-POSITIVE"
+        banner = f"Features suggestive of {cond} detected. Clinical review is advised."
+        impression = f"Findings suggestive of {cond} (AI screening result: AFFECTED)."
+        statement = (f"Automated analysis of the submitted clinical image identified features suggestive of "
+                     f"{cond}. The model assigned a probability of {conf_txt} to the '{label}' category "
+                     f"({level} confidence).{runner_txt} Image-based AI screening supports, but does not "
+                     f"replace, clinical examination.")
+    elif outcome == "Not affected":
+        headline = "SCREEN-NEGATIVE"
+        banner = f"No features suggestive of {cond} were identified."
+        impression = f"No features suggestive of {cond} identified (AI screening result: NOT AFFECTED)."
+        statement = (f"Automated analysis of the submitted clinical image did not identify features suggestive "
+                     f"of {cond}. The model assigned a probability of {conf_txt} to the '{label}' category "
+                     f"({level} confidence).{runner_txt} A negative screen does not exclude disease; "
+                     f"clinical correlation remains necessary.")
+    else:
+        headline = "RESULT"
+        banner = "Affected / not affected is not configured for this model."
+        impression = f"Model output: {label} ({conf_txt})."
+        statement = (f"The model assigned a probability of {conf_txt} to the '{label}' category ({level} "
+                     f"confidence).{runner_txt} The clinical meaning of this category has not been configured, "
+                     f"so the result should be interpreted by the treating clinician.")
+
+    cautions = []
+    if conf < 60:
+        headline = "INDETERMINATE"
+        cautions.append("Low model confidence: manual expert review is required before relying on this result.")
+    if conf >= 99:
+        cautions.append("A very high model score does not guarantee correctness, particularly if the image "
+                        "differs from the images the model was trained on.")
+    caution = " ".join(cautions) or None
+
+    recs = {
+        ("foot", "Affected"): [
+            "Clinical examination of the lesion by the treating physician or wound-care specialist, including "
+            "measurement, depth assessment and evaluation for signs of infection.",
+            "Assess peripheral vascular status and sensory neuropathy (pedal pulses, ankle-brachial index, "
+            "monofilament testing) according to local protocol.",
+            "Review glycaemic control (HbA1c) and optimise diabetes management.",
+            "Wound care and pressure off-loading as advised by the treating team.",
+            "Seek urgent review for spreading redness, swelling, purulent discharge, odour, fever or "
+            "increasing pain.",
+        ],
+        ("foot", "Not affected"): [
+            "Continue daily self-inspection of the feet and wear appropriate protective footwear.",
+            "Routine annual diabetic foot examination, more often if risk factors are present.",
+            "Maintain glycaemic, blood-pressure and lipid control.",
+            "Re-screen or seek review if a new wound, blister, colour change or swelling appears.",
+        ],
+        ("eye", "Affected"): [
+            "Dilated fundus examination by an ophthalmologist to confirm the finding and grade severity.",
+            "Referral timing to follow severity grading; urgent referral if vision changes are reported.",
+            "Review and optimise glycaemic, blood-pressure and lipid control.",
+        ],
+        ("eye", "Not affected"): [
+            "Continue routine periodic retinal screening as per guidelines.",
+            "Maintain glycaemic, blood-pressure and lipid control.",
+            "Seek review promptly if visual symptoms develop.",
+        ],
+        ("generic", "Affected"): [
+            "Clinical correlation with history and examination by the treating clinician.",
+            "Confirmatory investigation as per standard of care, with specialist referral as clinically indicated.",
+            "Review and optimise diabetes control.",
+        ],
+        ("generic", "Not affected"): [
+            "Routine follow-up as per clinical guidelines.",
+            "Re-screen or seek review if new symptoms develop.",
+        ],
+    }
+    recommendations = recs.get((kind, outcome)) or [
+        "Correlate this model output with clinical examination.",
+        "Follow-up is determined by the treating clinician.",
+    ]
+    if conf < 60:
+        recommendations = recommendations + [
+            "Repeat imaging with a clear, well-lit, in-focus close-up photograph and/or obtain expert review."]
+
+    return {"outcome": outcome, "condition": cond, "headline": headline, "banner": banner,
+            "impression": impression, "statement": statement, "caution": caution,
+            "recommendations": recommendations, "confidence_text": conf_txt, "level": level}
+
+
+def build_report_pdf(record, patient, filepath):
+    """Builds the clinical-style PDF screening report and writes it to filepath."""
+    from xml.sax.saxutils import escape as esc
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer,
+                                     Table, TableStyle, KeepTogether, HRFlowable, Image as RLImage)
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.graphics.shapes import Drawing, Rect
+    from PIL import Image as PILImage
+
+    summary = clinical_summary(record)
+    outcome = summary["outcome"]
+    PRIMARY = colors.HexColor("#5b21b6")
+    ACCENT = colors.HexColor("#8b5cf6")
+    LIGHT = colors.HexColor("#f5f3ff")
+    TEXT = colors.HexColor("#1f2937")
+    MUTED = colors.HexColor("#6b7280")
+    BORDER = colors.HexColor("#e5e7eb")
+    sev = colors.HexColor({"Affected": "#b91c1c", "Not affected": "#15803d"}.get(outcome, "#5b21b6"))
+    if summary["headline"] == "INDETERMINATE":  # low confidence must not look reassuring
+        sev = colors.HexColor("#b45309")
+
+    W, H = A4
+    LM = RM = 18 * mm
+    CW = W - LM - RM
+
+    lbl = ParagraphStyle("lbl", fontName="Helvetica-Bold", fontSize=7, leading=9, textColor=MUTED)
+    val = ParagraphStyle("val", fontName="Helvetica", fontSize=9.5, leading=12, textColor=TEXT)
+    h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=11.5, leading=14, textColor=PRIMARY, spaceBefore=8)
+    body = ParagraphStyle("body", fontName="Helvetica", fontSize=9.2, leading=13.2, textColor=TEXT)
+    small = ParagraphStyle("small", fontName="Helvetica", fontSize=7.8, leading=10.5, textColor=MUTED)
+    cap = ParagraphStyle("cap", parent=small, alignment=TA_CENTER)
+    bul = ParagraphStyle("bul", parent=body, leftIndent=11, firstLineIndent=-11, spaceAfter=3)
+    sbul = ParagraphStyle("sbul", parent=small, leftIndent=9, firstLineIndent=-9, spaceAfter=2)
+    title = ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=17, leading=21, textColor=TEXT)
+    sub = ParagraphStyle("sub", fontName="Helvetica", fontSize=9.5, leading=13, textColor=MUTED)
+    head = ParagraphStyle("head", fontName="Helvetica-Bold", fontSize=15, leading=19, textColor=sev)
+    imp = ParagraphStyle("imp", fontName="Helvetica-Bold", fontSize=10.5, leading=14.5, textColor=TEXT)
+    warn = ParagraphStyle("warn", parent=body, textColor=colors.HexColor("#b45309"), fontSize=8.6, leading=12)
+    disc = ParagraphStyle("disc", fontName="Helvetica", fontSize=7.8, leading=11, textColor=colors.HexColor("#7f1d1d"))
+
+    created = record.created_at.strftime("%d %b %Y, %H:%M UTC") if record.created_at else "N/A"
+    report_no = f"DV-{record.id:04d}"
+    cond_title = (CONDITION_NAME or "Clinical").strip()
+
+    def section(t):
+        return [Paragraph(t, h2), HRFlowable(width="100%", thickness=0.8, color=ACCENT, spaceBefore=1, spaceAfter=6)]
+
+    def decorate(canv, doc):
+        canv.saveState()
+        canv.setFillColor(PRIMARY)
+        canv.rect(0, H - 26 * mm, W, 26 * mm, stroke=0, fill=1)
+        canv.setFillColor(ACCENT)
+        canv.rect(0, H - 27.2 * mm, W, 1.2 * mm, stroke=0, fill=1)
+        canv.setFillColor(colors.white)
+        canv.setFont("Helvetica-Bold", 19)
+        canv.drawString(LM, H - 14 * mm, "DiaVision AI")
+        canv.setFont("Helvetica", 8)
+        canv.drawString(LM, H - 20 * mm, "INTELLIGENCE SUITE  |  AI-ASSISTED SCREENING REPORT")
+        canv.setFont("Helvetica-Bold", 9.5)
+        canv.drawRightString(W - RM, H - 13 * mm, f"Report No. {report_no}")
+        canv.setFont("Helvetica", 8)
+        canv.drawRightString(W - RM, H - 19 * mm, f"Generated: {created}")
+        canv.setStrokeColor(BORDER)
+        canv.setLineWidth(0.6)
+        canv.line(LM, 15 * mm, W - RM, 15 * mm)
+        canv.setFillColor(MUTED)
+        canv.setFont("Helvetica", 7.5)
+        canv.drawString(LM, 10.5 * mm, f"Confidential  |  Patient {patient.patient_code}  |  AI-generated decision support, not a final diagnosis.")
+        canv.drawRightString(W - RM, 10.5 * mm, f"Page {doc.page}")
+        canv.restoreState()
+
+    story = [Paragraph("AI-Assisted Screening Report", title),
+             Paragraph(f"{esc(cond_title)} screening from a clinical photograph", sub),
+             Spacer(1, 6)]
+
+    # ---- 1. Patient & examination details ---------------------------------
+    name = (patient.name or "").strip() or "Not provided"
+    duration = f"{patient.duration_years:g} years" if patient.duration_years else "N/A"
+    P = lambda t: Paragraph(esc(str(t)), val)
+    L = lambda t: Paragraph(t, lbl)
+    details = Table([
+        [L("PATIENT NAME"), P(name), L("PATIENT ID"), P(patient.patient_code)],
+        [L("AGE / SEX"), P(f"{patient.age or 'N/A'} / {patient.gender or 'N/A'}"), L("DIABETES"),
+         P(f"{patient.diabetes_type or 'N/A'}  ({duration})")],
+        [L("EXAMINATION DATE"), P(created), L("REPORT NO."), P(report_no)],
+        [L("REVIEWING CLINICIAN"), P(record.reviewed_by or "Pending review"), L("IMAGE TYPE"),
+         P("Clinical photograph (digital)")],
+    ], colWidths=[33 * mm, CW / 2 - 33 * mm, 29 * mm, CW / 2 - 29 * mm])
+    details.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story += section("Patient & Examination Details") + [details]
+
+    # ---- 2. Impression ----------------------------------------------------
+    cell = [Paragraph("IMPRESSION", lbl), Spacer(1, 2),
+            Paragraph(summary["headline"], head), Spacer(1, 2),
+            Paragraph(esc(summary["impression"]), imp), Spacer(1, 4),
+            Paragraph(esc(summary["statement"]), body)]
+    if summary["caution"]:
+        cell += [Spacer(1, 4), Paragraph("<b>Note:</b> " + esc(summary["caution"]), warn)]
+    box = Table([[cell]], colWidths=[CW])
+    box.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("LINEBEFORE", (0, 0), (0, 0), 4, sev),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fcfcfd")),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    story += section("Findings & Impression") + [box]
+
+    # ---- 3. Model output --------------------------------------------------
+    BAR_W = 70 * mm
+
+    def bar(prob, top):
+        d = Drawing(BAR_W, 4 * mm)
+        d.add(Rect(0, 0, BAR_W, 4 * mm, fillColor=colors.HexColor("#ede9fe"), strokeColor=None))
+        d.add(Rect(0, 0, max(BAR_W * prob, 0.6), 4 * mm, fillColor=(sev if top else ACCENT), strokeColor=None))
+        return d
+
+    ranked = sorted(record.probabilities.items(), key=lambda kv: kv[1], reverse=True)
+    rows = [[Paragraph("CATEGORY", lbl), Paragraph("MODEL PROBABILITY", lbl), Paragraph("SCORE", lbl)]]
+    for i, (label, prob) in enumerate(ranked):
+        rows.append([Paragraph(f"<b>{esc(label)}</b>" if i == 0 else esc(label), val), bar(prob, i == 0),
+                     Paragraph(f"<b>{prob * 100:.1f}%</b>" if i == 0 else f"{prob * 100:.1f}%", val)])
+    pr = Table(rows, colWidths=[CW * 0.34, BAR_W + 6 * mm, CW - CW * 0.34 - BAR_W - 6 * mm])
+    pr.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), LIGHT),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, BORDER),
+        ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story += [KeepTogether(section("Model Output") + [pr, Spacer(1, 3),
+              Paragraph(f"Predicted category: <b>{esc(record.prediction_label)}</b>  |  "
+                        f"Confidence: <b>{summary['confidence_text']}</b> ({summary['level']})", small)])]
+
+    # ---- 4. Visual evidence ----------------------------------------------
+    def fit_img(path, max_w, max_h):
+        with PILImage.open(path) as im:
+            w, h = im.size
+        s = min(max_w / w, max_h / h)
+        return RLImage(path, width=w * s, height=h * s)
+
+    img_path = os.path.join(UPLOAD_FOLDER, record.image_filename)
+    left = fit_img(img_path, 72 * mm, 56 * mm) if os.path.exists(img_path) else Paragraph("Image not available.", cap)
+    right = Paragraph("Saliency map not available for this analysis.", cap)
+    if record.gradcam_filename:
+        gp = os.path.join(UPLOAD_FOLDER, record.gradcam_filename)
+        if os.path.exists(gp):
+            right = fit_img(gp, 72 * mm, 56 * mm)
+    imgs = Table([[left, right],
+                  [Paragraph("Figure 1. Submitted clinical photograph", cap),
+                   Paragraph("Figure 2. Saliency map: warmer colours mark regions that most influenced the model", cap)]],
+                 colWidths=[CW / 2, CW / 2])
+    imgs.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+        ("BOX", (0, 0), (0, -1), 0.6, BORDER),
+        ("BOX", (1, 0), (1, -1), 0.6, BORDER),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fafafa")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story += [KeepTogether(section("Visual Evidence") + [imgs])]
+
+    # ---- 5. Recommendations ----------------------------------------------
+    recs = [Paragraph("\u2022  " + esc(r), bul) for r in summary["recommendations"]]
+    story += [KeepTogether(section("Suggested Next Steps") + recs +
+              [Paragraph("General guidance for consideration by the treating clinician; "
+                         "it does not replace individual clinical judgement.", small)])]
+
+    # ---- 6. Methodology & limitations --------------------------------------
+    lim = [
+        "Method: the photograph was analysed by an EfficientNet-based deep convolutional neural network; "
+        "the saliency map was produced with gradient-based class activation mapping.",
+        "The saliency map is indicative only. It highlights image regions that influenced the score and is not "
+        "a lesion segmentation or measurement.",
+        "Performance depends on image quality, framing, focus and lighting, and may be reduced for images that "
+        "differ from the training data.",
+        "This tool has not been validated as a stand-alone diagnostic device.",
+    ]
+    story += [KeepTogether(section("Methodology & Limitations") +
+              [Paragraph("\u2022  " + esc(t), sbul) for t in lim])]
+
+    # ---- 7. Sign-off + disclaimer ------------------------------------------
+    sign = Table([["", ""],
+                  [Paragraph(f"Reviewing clinician: <b>{esc(record.reviewed_by or '____________________')}</b>", small),
+                   Paragraph("Signature / date / stamp", small)]],
+                 colWidths=[CW * 0.55, CW * 0.45], rowHeights=[11 * mm, None])
+    sign.setStyle(TableStyle([
+        ("LINEABOVE", (0, 1), (0, 1), 0.6, TEXT),
+        ("LINEABOVE", (1, 1), (1, 1), 0.6, TEXT),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (0, -1), 14),
+    ]))
+    disclaimer = Table([[Paragraph(
+        "<b>Disclaimer:</b> This AI-generated analysis is intended for clinical decision support only and does "
+        "not constitute a final medical diagnosis. All results must be reviewed by a qualified healthcare "
+        "professional before any treatment planning.", disc)]], colWidths=[CW])
+    disclaimer.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fef2f2")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#fecaca")),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+    ]))
+    story += [Spacer(1, 8), KeepTogether([sign, Spacer(1, 8), disclaimer])]
+
+    doc = BaseDocTemplate(filepath, pagesize=A4, leftMargin=LM, rightMargin=RM,
+                          topMargin=32 * mm, bottomMargin=20 * mm,
+                          title=f"DiaVision AI Screening Report {report_no}", author="DiaVision AI")
+    frame = Frame(LM, 20 * mm, CW, H - 32 * mm - 20 * mm, leftPadding=0, rightPadding=0,
+                  topPadding=0, bottomPadding=0)
+    doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=decorate)])
+    doc.build(story)
+
+
+@app.route("/reports/<int:analysis_id>/download")
+@login_required
+def download_report(analysis_id):
+    record = Analysis.query.get_or_404(analysis_id)
+    patient = record.patient
+    filename = f"DiaVision_Report_{record.id:04d}_{patient.patient_code}.pdf"
+    filepath = os.path.join(app.config["REPORTS_FOLDER"], filename)
+    build_report_pdf(record, patient, filepath)
+    return send_from_directory(app.config["REPORTS_FOLDER"], filename, as_attachment=True)
+
+
+@app.route("/analytics")
+@login_required
+def analytics():
+    counts = {name: 0 for name in CLASS_NAMES}
+    for label, in db.session.query(Analysis.prediction_label).all():
+        counts[label] = counts.get(label, 0) + 1
+    total = sum(counts.values()) or 1
+    avg_confidence = db.session.query(db.func.avg(Analysis.confidence)).scalar() or 0
+    return render_template(
+        "analytics.html",
+        counts=counts,
+        total=total,
+        avg_confidence=avg_confidence,
+        total_patients=Patient.query.count(),
+        total_analyses=Analysis.query.count(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assistant — supports either Grok (xAI, api.x.ai) or Groq Cloud
+# (api.groq.com — fast hosted inference for models like Llama). These are
+# two different services with different keys, easy to mix up by name.
+# Set GROK_API_KEY for xAI's Grok, or GROQ_API_KEY for Groq Cloud — set
+# either (or both). Falls back to a rule-based responder if neither key
+# works or the call fails for any reason.
+#
+# Reply format: the model is asked to answer in a light structure
+# ("## Heading", "- bullet", "1. step", "**bold**", "Note: ...") which the
+# chat page (templates/chatbot.html) renders as headings, lists and a note box.
+# ---------------------------------------------------------------------------
+GROK_API_KEY = os.environ.get("GROK_API_KEY", "").strip()
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-4")
+GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+if GROK_API_KEY:
+    print(f"[DiaVision] Grok (xAI) assistant: ENABLED ({GROK_MODEL})")
+if GROQ_API_KEY:
+    print(f"[DiaVision] Groq Cloud assistant: ENABLED ({GROQ_MODEL})")
+if not GROK_API_KEY and not GROQ_API_KEY:
+    print("[DiaVision] No GROK_API_KEY or GROQ_API_KEY set — chatbot using rule-based fallback only.")
+
+ASSISTANT_SYSTEM_PROMPT = (
+    "You are the DiaVision Assistant, embedded in a diabetic retinopathy screening "
+    "dashboard used by clinicians. Be concise and clinically accurate. You can explain DR "
+    "grading, general diabetic eye disease education, suggest sensible next clinical steps "
+    "for a given finding (follow-up interval, referral to ophthalmology), and answer "
+    "questions about using the app (New Analysis, Patients, History, Reports, Analytics). "
+    "You have no live access to this session's patient records or images unless the user "
+    "pastes details into the chat. Never present your output as a final diagnosis or "
+    "treatment order.\n\n"
+    "FORMAT RULES (very important, follow exactly):\n"
+    "- Start with ONE short sentence that directly answers the question.\n"
+    "- Then use 2 to 4 sections. Each section starts with its own line like '## Section title'.\n"
+    "- Under each section use short bullets, each on its own line starting with '- '. "
+    "Use '1. ', '2. ', '3. ' on separate lines for step-by-step instructions. "
+    "Keep bullets short (about 12 words or fewer).\n"
+    "- Put key terms in **bold**.\n"
+    "- Never write a paragraph longer than 2 lines.\n"
+    "- For a very simple question (greeting, yes/no), answer in 1 to 2 short sentences "
+    "with no sections.\n"
+    "- When you give clinical suggestions, end with one line starting 'Note:' saying the "
+    "suggestion needs review by the attending clinician.\n"
+    "- No tables, no HTML, no emojis. Keep the whole answer under 180 words."
+)
+
+# Each entry: (keywords, structured answer). First match wins, so keep the
+# MORE SPECIFIC entries above the general ones. Short keywords (3 letters or
+# fewer) must match as whole words; longer ones match as word prefixes.
+KB = [
+    (["grade", "grading", "stage", "stages", "severity", "mild", "moderate", "severe", "proliferative", "npdr", "pdr"],
+     "Diabetic retinopathy is graded in five levels, from no disease to vision-threatening disease.\n\n"
+     "## The 5 grades\n"
+     "- **No DR:** no visible retinal signs\n"
+     "- **Mild:** microaneurysms only\n"
+     "- **Moderate:** hemorrhages and hard exudates\n"
+     "- **Severe:** extensive hemorrhages, venous beading\n"
+     "- **Proliferative:** new fragile vessels, highest risk of vision loss\n\n"
+     "## Why grading matters\n"
+     "- It decides the follow-up interval\n"
+     "- It decides how urgent the referral is\n\n"
+     "Note: AI suggestions require review by the attending clinician."),
+
+    (["follow-up", "follow up", "followup", "next step", "next steps", "refer", "referral", "treatment", "treat", "manage"],
+     "Follow-up depends on the DR grade, and the treating clinician makes the final decision.\n\n"
+     "## Typical follow-up\n"
+     "- **No or mild DR:** routine screening about every 12 months\n"
+     "- **Moderate DR:** ophthalmology review within 3 to 6 months\n"
+     "- **Severe or proliferative DR:** urgent ophthalmology referral\n\n"
+     "## For every patient\n"
+     "- Optimise blood sugar, blood pressure and lipids\n"
+     "- Report any sudden vision change at once\n\n"
+     "Note: these are general suggestions and need clinician review."),
+
+    (["heatmap", "grad-cam", "gradcam", "grad cam", "saliency", "highlight", "highlighted"],
+     "The heatmap shows which parts of the image influenced the model's prediction most.\n\n"
+     "## How to read it\n"
+     "- **Warm colours (red, yellow):** most influence on the result\n"
+     "- **Cool or no colour:** little influence\n\n"
+     "## Limits\n"
+     "- It is indicative only, not a lesion outline\n"
+     "- It cannot replace a clinical examination\n\n"
+     "Note: AI suggestions require review by the attending clinician."),
+
+    (["analytics", "chart", "charts", "statistics", "stats", "dashboard"],
+     "The Analytics and Dashboard pages summarise all screenings done so far.\n\n"
+     "## What you can see\n"
+     "- Total patients and total analyses\n"
+     "- How many results fall in each class\n"
+     "- Average model confidence\n"
+     "- Recent patients and recent analyses (Dashboard)"),
+
+    (["history", "past", "previous", "earlier", "filter"],
+     "Prediction History lists every earlier analysis, newest first.\n\n"
+     "## What you can do\n"
+     "- Filter the list by predicted class\n"
+     "- Open any row to see its full result page\n"
+     "- Download the PDF report for that analysis"),
+
+    (["patient", "patients", "add patient", "new patient", "profile"],
+     "Patients are created while running an analysis, and each patient keeps their own history.\n\n"
+     "## Add a patient\n"
+     "1. Open **New Analysis**\n"
+     "2. Choose **new** in the patient selector\n"
+     "3. Fill in the patient details\n"
+     "4. Upload the image and run the analysis\n\n"
+     "## View a patient\n"
+     "- Open **Patients**, search by name or ID, then click the patient"),
+
+    (["upload", "new analysis", "run analysis", "analyse", "analyze", "diagnosis", "scan", "image", "how do i", "how to"],
+     "Running an analysis takes four quick steps.\n\n"
+     "## Steps\n"
+     "1. Open **New Analysis**\n"
+     "2. Pick an existing patient or add a new one\n"
+     "3. Upload a clear, well-lit, in-focus image (PNG, JPG, TIFF or BMP, up to 20 MB)\n"
+     "4. Click run, and you go straight to the result page\n\n"
+     "## Tip\n"
+     "- Sharp, well-framed images give more reliable results"),
+
+    (["report", "reports", "download", "pdf", "print"],
+     "You can download a PDF screening report for any analysis.\n\n"
+     "## Where to find it\n"
+     "- On the **Reports** page, for any past analysis\n"
+     "- Directly from any **result** page\n\n"
+     "## What the PDF contains\n"
+     "- Patient details and the impression\n"
+     "- Class probabilities and the heatmap\n"
+     "- Suggested next steps and limitations"),
+
+    (["confidence", "accuracy", "accurate", "reliable", "trust", "probability", "score"],
+     "Confidence is the model's probability for its top class, and it is not a guarantee of correctness.\n\n"
+     "## How to use it\n"
+     "- **85% or higher:** high confidence\n"
+     "- **60 to 85%:** moderate, review carefully\n"
+     "- **Below 60%:** low, expert review is required\n\n"
+     "## Remember\n"
+     "- Even a very high score can be wrong on unusual images\n"
+     "- Always correlate with clinical examination\n\n"
+     "Note: AI suggestions require review by the attending clinician."),
+
+    (["dr", "retinopathy", "diabetic eye", "what is"],
+     "Diabetic retinopathy (DR) is damage to the retina's blood vessels caused by long-term high blood sugar.\n\n"
+     "## What happens\n"
+     "- Tiny vessels leak or close off\n"
+     "- In advanced disease, fragile new vessels grow\n"
+     "- Swelling at the macula can reduce central vision\n\n"
+     "## Why screening matters\n"
+     "- Early DR usually has no symptoms\n"
+     "- Early treatment can prevent vision loss\n\n"
+     "Note: AI suggestions require review by the attending clinician."),
+
+    (["hi", "hii", "hello", "hey", "good morning", "good afternoon", "good evening", "thanks", "thank you"],
+     "Hello! I'm the DiaVision Assistant.\n\n"
+     "## I can help with\n"
+     "- DR grades and what they mean\n"
+     "- Suggested next steps and follow-up\n"
+     "- Running analyses and reading results\n"
+     "- Patients, history, reports and analytics"),
+]
+
+
+def _kw_in_text(keyword, text):
+    """Whole-word match for short keywords, word-prefix match for longer ones,
+    so 'dr' does not fire inside 'address' or 'drug'."""
+    import re
+    k = re.escape(keyword)
+    pattern = rf"\b{k}\b" if len(keyword) <= 3 else rf"\b{k}"
+    return re.search(pattern, text) is not None
+
+
+def rule_based_reply(message):
+    text = message.lower()
+    for keywords, answer in KB:
+        if any(_kw_in_text(k, text) for k in keywords):
+            return answer
+    return ("I can help with questions about diabetic retinopathy grading, using the analysis "
+            "workflow, or your reports.\n\n"
+            "## Try asking\n"
+            "- What are the DR grades?\n"
+            "- What follow-up is suggested for moderate DR?\n"
+            "- How do I run a new analysis?\n"
+            "- How do I download a report?\n\n"
+            "(Set GROK_API_KEY or GROQ_API_KEY in .env for richer, LLM-powered answers.)")
+
+
+def clean_reply(text):
+    """Normalises model output into the light structure the chat page renders:
+    '## Heading', '- bullet', '1. step', **bold**, and 'Note: ...' lines.
+    Tables and HTML are flattened because the page does not render them."""
+    import re
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s and "-" in s and re.fullmatch(r"[|\s:\-]+", s):   # table separator row
+            continue
+        if s.startswith("|") and s.endswith("|"):            # table row -> one line
+            cells = [c.strip() for c in s.strip("|").split("|") if c.strip()]
+            s = " - ".join(cells)
+        lines.append(s)
+    text = "\n".join(lines)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)       # <br> -> newline
+    text = re.sub(r"<[^>]+>", "", text)                      # drop other HTML tags
+    text = re.sub(r"^\s*---+\s*$", "", text, flags=re.M)      # horizontal rules
+    text = re.sub(r"^#{1,6}\s*", "## ", text, flags=re.M)     # normalise all headings to '## '
+    text = re.sub(r"^\s*[*\u2022]\s+", "- ", text, flags=re.M)  # * or bullet -> '- '
+    text = re.sub(r"__(.+?)__", r"**\1**", text)              # __bold__ -> **bold**
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _call_openai_compatible(url, api_key, model, message, history):
+    import requests
+    messages = [{"role": "system", "content": ASSISTANT_SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
+
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": model, "messages": messages, "temperature": 0.3},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return clean_reply(data["choices"][0]["message"]["content"])
+
+
+LLM_LAST_ERROR = {}   # service name -> short reason for the last failure (never contains keys)
+
+
+def _describe_llm_error(exc):
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = resp.status_code
+        hint = {401: "the API key was rejected (wrong, deleted or revoked)",
+                403: "access denied for this key or model",
+                404: "model not found (name wrong or retired)",
+                400: "request rejected (often a retired or wrong model name)",
+                429: "rate limit reached, try again shortly"}.get(code, "service error")
+        return f"HTTP {code}: {hint}"
+    return f"{type(exc).__name__}: could not reach the service (check internet or firewall)"
+
+
+def grok_reply(message, history):
+    """Calls xAI's Grok API. Returns None (never raises) on any failure so
+    the caller can fall back cleanly — missing key, network error, bad
+    response, whatever."""
+    if not GROK_API_KEY:
+        return None
+    try:
+        reply = _call_openai_compatible(GROK_API_URL, GROK_API_KEY, GROK_MODEL, message, history)
+        LLM_LAST_ERROR["grok"] = None
+        return reply
+    except Exception as exc:  # pragma: no cover
+        LLM_LAST_ERROR["grok"] = _describe_llm_error(exc)
+        app.logger.warning("Grok (xAI) API call failed, falling back: %s", exc)
+        return None
+
+
+def groq_reply(message, history):
+    """Calls Groq Cloud's OpenAI-compatible API. Same never-raises contract
+    as grok_reply()."""
+    if not GROQ_API_KEY:
+        return None
+    if GROQ_API_KEY.upper().startswith("PASTE"):
+        LLM_LAST_ERROR["groq"] = "GROQ_API_KEY in .env is still the placeholder text; paste your real key"
+        return None
+    try:
+        reply = _call_openai_compatible(GROQ_API_URL, GROQ_API_KEY, GROQ_MODEL, message, history)
+        LLM_LAST_ERROR["groq"] = None
+        return reply
+    except Exception as exc:  # pragma: no cover
+        LLM_LAST_ERROR["groq"] = _describe_llm_error(exc)
+        app.logger.warning("Groq Cloud API call failed, falling back: %s", exc)
+        return None
+
+
+def llm_reply(message, history):
+    """Tries Groq first (since that's what most people setting GROQ_API_KEY
+    actually want — fast + often free-tier), then Grok, then the
+    rule-based fallback. Returns (reply, source)."""
+    for name, fn in (("groq", groq_reply), ("grok", grok_reply)):
+        reply = fn(message, history)
+        if reply is not None:
+            return reply, name
+    reply = rule_based_reply(message)
+    problems = [f"{name.capitalize()}: {why}" for name, why in LLM_LAST_ERROR.items() if why]
+    if (GROQ_API_KEY or GROK_API_KEY) and problems:
+        reply = (reply.split("(Set GROK_API_KEY")[0].strip()
+                 + "\n\nNote: the online AI assistant is unavailable right now (" + "; ".join(problems)
+                 + "). This is the built-in helper. Check .env and restart the app.")
+    return reply, "rules"
+
+
+@app.route("/chatbot")
+@login_required
+def chatbot():
+    return render_template("chatbot.html", grok_enabled=bool(GROK_API_KEY), groq_enabled=bool(GROQ_API_KEY))
+
+
+@app.route("/api/chatbot", methods=["POST"])
+@login_required
+def api_chatbot():
+    from flask import session
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"reply": "Please type a question."}), 400
+
+    history = session.get("chat_history", [])
+    reply, source = llm_reply(message, history)
+
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": reply})
+    session["chat_history"] = history[-12:]  # keep last ~6 exchanges for context
+
+    return jsonify({"reply": reply, "source": source})
+
+
+@app.route("/api/chatbot/reset", methods=["POST"])
+@login_required
+def api_chatbot_reset():
+    from flask import session
+    session.pop("chat_history", None)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Developer & support details
+# Edit the defaults below, or set DEV_* / SUPPORT_* values in .env.
+# Available in EVERY template as {{ dev.name }}, {{ dev.linkedin }}, etc.
+# ---------------------------------------------------------------------------
+def _digits_for_tel(number):
+    import re
+    return re.sub(r"[^\d+]", "", number or "")
+
+
+DEVELOPER_INFO = {
+    "name": os.environ.get("DEV_NAME", "Your Name"),
+    "role": os.environ.get("DEV_ROLE", "Developer, DiaVision AI"),
+    "bio": os.environ.get("DEV_BIO", "Built DiaVision AI to support early diabetic retinopathy screening."),
+    "linkedin": os.environ.get("DEV_LINKEDIN", "https://www.linkedin.com/in/your-profile"),
+    "instagram": os.environ.get("DEV_INSTAGRAM", "https://www.instagram.com/your_username"),
+    "support_phone": os.environ.get("SUPPORT_PHONE", "+91 00000 00000"),
+    "support_email": os.environ.get("SUPPORT_EMAIL", "").strip(),
+}
+DEVELOPER_INFO["support_phone_link"] = _digits_for_tel(DEVELOPER_INFO["support_phone"])
+DEVELOPER_INFO["initial"] = (DEVELOPER_INFO["name"] or "D")[0].upper()
+
+
+@app.context_processor
+def inject_developer_info():
+    return {"dev": DEVELOPER_INFO}
+
+
+@app.route("/developer")
+@login_required
+def developer():
+    return render_template("developer.html")
+
+
+# ---------------------------------------------------------------------------
+# File serving
+# ---------------------------------------------------------------------------
+def _migrate_labels(mapping):
+    """Renames stored labels (and probability keys) so old results match the
+    newly saved class names. Returns how many records changed."""
+    changed = 0
+    for rec in Analysis.query.all():
+        probs = json.loads(rec.probabilities_json)
+        new_label = mapping.get(rec.prediction_label, rec.prediction_label)
+        new_probs = {mapping.get(k, k): v for k, v in probs.items()}
+        if new_label != rec.prediction_label or new_probs != probs:
+            rec.prediction_label = new_label
+            rec.probabilities_json = json.dumps(new_probs)
+            changed += 1
+    db.session.commit()
+    return changed
+
+
+@app.route("/settings/classes", methods=["GET", "POST"])
+@login_required
+def class_setup():
+    """Lets the user name the model's outputs and mark which one means
+    'not affected', without editing files."""
+    n_out = int(MODEL.output_shape[-1]) if MODEL is not None else len(CLASS_NAMES)
+
+    if request.method == "POST":
+        names = [request.form.get(f"name_{i}", "").strip() for i in range(n_out)]
+        healthy = [names[i] for i in range(n_out) if request.form.get(f"healthy_{i}") and names[i]]
+        if any(not n for n in names):
+            flash("Please give every output a name.", "error")
+        elif len({n.lower() for n in names}) != len(names):
+            flash("Each output needs a different name.", "error")
+        elif any(len(n) > 40 for n in names):
+            flash("Names must be 40 characters or fewer.", "error")
+        else:
+            mapping = {}
+            for i, new in enumerate(names):
+                mapping[f"Class {i}"] = new
+                if i < len(CLASS_NAMES):
+                    mapping[CLASS_NAMES[i]] = new
+            if n_out == 3:  # old placeholder DR names used before setup
+                for old, i in {"No DR": 0, "Mild DR": 1, "Moderate DR": 2}.items():
+                    mapping.setdefault(old, names[i])
+            changed = _migrate_labels(mapping)
+
+            with open(CLASS_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"names": names, "not_affected": healthy,
+                           "condition": request.form.get("condition", "").strip()[:80]}, f, indent=2)
+            CLASS_NAMES[:] = names
+            global CONDITION_NAME
+            CONDITION_NAME = request.form.get("condition", "").strip()[:80]
+            NOT_AFFECTED_CLASSES[:] = [h.lower() for h in healthy]
+            flash(f"Class setup saved. {changed} earlier result(s) were renamed to match.", "success")
+
+            # Non-blocking sanity checks: warn if the ticks and names look inconsistent.
+            import re
+            sounds_healthy = lambda n: bool(re.search(r"(^|[^a-z])(not|no|non|healthy|normal|negative|control)", n.lower()))
+            for n in names:
+                ticked = n in healthy
+                if ticked and not sounds_healthy(n):
+                    flash(f'"{n}" is ticked as NOT affected (healthy), but its name does not sound healthy. '
+                          f'If that is wrong, untick it and save again.', "warning")
+                elif (not ticked) and sounds_healthy(n):
+                    flash(f'"{n}" sounds like a healthy class but is not ticked as "Not affected". '
+                          f'If it is the healthy class, tick it and save again.', "warning")
+            if not healthy:
+                flash("No class is ticked as healthy, so every result will show as Affected.", "warning")
+            return redirect(url_for("class_setup"))
+
+    names = list(CLASS_NAMES)[:n_out] + [""] * max(0, n_out - len(CLASS_NAMES))
+    healthy_flags = [n.strip().lower() in NOT_AFFECTED_CLASSES for n in names]
+    return render_template("class_setup.html", n_out=n_out, names=names, healthy=healthy_flags,
+                           condition=CONDITION_NAME)
+
+
+@app.route("/uploads/<path:filename>")
+@login_required
+def uploaded_file(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+def ensure_schema():
+    """Lightweight auto-migration: adds any columns this version of the
+    app expects that an existing diavision.db (or Turso DB) doesn't have
+    yet, so upgrading the app doesn't require deleting your database.
+    Safe to run every startup — it's a no-op once columns already exist."""
+    try:
+        with db.engine.connect() as conn:
+            existing = {row[1] for row in conn.execute(db.text("PRAGMA table_info(analysis)")).fetchall()}
+            statements = []
+            if "gradcam_filename" not in existing:
+                statements.append("ALTER TABLE analysis ADD COLUMN gradcam_filename VARCHAR(255)")
+            if "gradcam_error" not in existing:
+                statements.append("ALTER TABLE analysis ADD COLUMN gradcam_error TEXT")
+            for stmt in statements:
+                conn.execute(db.text(stmt))
+            if statements:
+                conn.commit()
+                print(f"[DiaVision] Migrated database schema ({len(statements)} column(s) added).")
+    except Exception as exc:  # pragma: no cover
+        print(f"[DiaVision] Schema check skipped (non-fatal): {exc}")
+
+
+def seed_demo_data():
+    db.create_all()
+    ensure_schema()
+    if not User.query.filter_by(email="doctor@diavision.ai").first():
+        demo = User(name="Dr. Julian Vance", email="doctor@diavision.ai", role="Senior Endocrinologist")
+        demo.set_password("password123")
+        db.session.add(demo)
+        db.session.commit()
+
+
+if __name__ == "__main__":
+    with app.app_context():
+        seed_demo_data()
+    app.run(debug=False, use_reloader=False)

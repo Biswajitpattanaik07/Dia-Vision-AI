@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Clinical Reports | DiaVision AI{% endblock %}
+{% block page_title %}Clinical Reports{% endblock %}
+
+{% block content %}
+<h2 class="text-headline-lg font-headline-lg text-white">Dermatological Screening Reports</h2>
+<p class="text-on-surface-variant -mt-3">
+  Download a structured clinical summary for each completed AI-assisted lesion assessment,
+  including the model's diagnostic impression, confidence level, and recommended follow-up.
+</p>
+
+<div class="grid grid-cols-1 md:grid-cols-2 gap-gutter">
+  {% for a in records %}
+  {% set pct = (a.confidence * 100)|round(1) %}
+  {% if pct >= 85 %}
+    {% set tier = 'High confidence' %}
+    {% set advice = 'Clinical correlation advised' %}
+    {% set badge = 'bg-emerald-500/10 text-emerald-400' %}
+  {% elif pct >= 60 %}
+    {% set tier = 'Moderate confidence' %}
+    {% set advice = 'Dermatologist review recommended' %}
+    {% set badge = 'bg-amber-500/10 text-amber-400' %}
+  {% else %}
+    {% set tier = 'Low confidence' %}
+    {% set advice = 'Specialist evaluation / biopsy consideration' %}
+    {% set badge = 'bg-red-500/10 text-red-400' %}
+  {% endif %}
+
+  <div class="glass-card rounded-2xl p-6 flex items-start gap-4 hover:border-primary/40 transition-all border border-transparent">
+    <div class="bg-primary/10 text-primary p-3 rounded-lg">
+      <span class="material-symbols-outlined">clinical_notes</span>
+    </div>
+
+    <div class="flex-1 overflow-hidden">
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-on-surface-variant text-label-sm font-medium uppercase tracking-wider">
+          Report #{{ '%05d'|format(a.id) }}
+        </span>
+        <span class="text-xs font-semibold px-2 py-0.5 rounded-full {{ badge }}">{{ tier }}</span>
+      </div>
+
+      <div class="text-white text-body-md font-semibold truncate mt-1">
+        {{ a.patient.name if a.patient else 'Unidentified patient' }}
+      </div>
+
+      <div class="text-on-surface-variant text-label-sm mt-2 space-y-0.5">
+        <div><span class="font-semibold text-white/80">AI diagnostic impression:</span> {{ a.prediction_label }}</div>
+        <div><span class="font-semibold text-white/80">Model confidence score:</span> {{ pct }}%</div>
+        <div><span class="font-semibold text-white/80">Date of assessment:</span> {{ a.created_at.strftime('%d %b %Y, %H:%M') }}</div>
+        <div><span class="font-semibold text-white/80">Recommended action:</span> {{ advice }}</div>
+      </div>
+
+      <p class="text-on-surface-variant/70 text-xs mt-3 italic">
+        Computer-aided screening result. Not a definitive diagnosis; requires confirmation by a licensed clinician.
+      </p>
+    </div>
+
+    <a href="{{ url_for('download_report', analysis_id=a.id) }}"
+       title="Download clinical report (PDF)"
+       class="text-primary hover:text-white transition-colors">
+      <span class="material-symbols-outlined">cloud_download</span>
+    </a>
+  </div>
+  {% else %}
+  <div class="glass-card rounded-2xl p-8 text-center text-on-surface-variant md:col-span-2">
+    No clinical reports available. Complete a lesion analysis to generate a report.
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

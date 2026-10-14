@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}DiaVision AI{% endblock %}</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+<script>
+tailwind.config = {
+  darkMode: "class",
+  theme: {
+    extend: {
+      colors: {
+        "on-surface-variant": "#A19DAA", "background": "#000000", "surface-container": "#0A0A0C",
+        "surface-container-high": "#121214", "surface-container-highest": "#1A1A1E",
+        "on-background": "#F0F4FF", "on-surface": "#FFFFFF", "primary": "#d0bcff",
+        "on-primary": "#3c0091", "primary-container": "#a078ff", "on-primary-container": "#340080",
+        "secondary": "#4edea3", "on-secondary": "#003824", "secondary-container": "#00a572",
+        "error": "#ffb4ab", "on-error": "#690005",
+      },
+      fontFamily: { "headline-md": ["Manrope"], "body-md": ["Inter"], "headline-lg": ["Manrope"],
+                    "label-sm": ["Inter"], "display-lg": ["Manrope"], "body-lg": ["Inter"] },
+      fontSize: {
+        "headline-md": ["24px", {"lineHeight": "1.3", "fontWeight": "600"}],
+        "body-md": ["16px", {"lineHeight": "1.5", "fontWeight": "400"}],
+        "headline-lg": ["32px", {"lineHeight": "1.2", "fontWeight": "700"}],
+        "label-sm": ["12px", {"lineHeight": "1", "letterSpacing": "0.05em", "fontWeight": "600"}],
+        "display-lg": ["48px", {"lineHeight": "1.1", "letterSpacing": "-0.02em", "fontWeight": "800"}],
+        "body-lg": ["18px", {"lineHeight": "1.6", "fontWeight": "400"}]
+      },
+      spacing: { "gutter": "20px", "container-padding": "24px", "margin-mobile": "16px", "margin-desktop": "32px" }
+    }
+  }
+}
+</script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="font-body-md text-body-md overflow-x-hidden">
+
+<aside class="hidden md:flex flex-col h-screen w-64 fixed z-50 bg-black/80 backdrop-blur-3xl border-r border-white/5 py-6 space-y-2">
+  <div class="px-6 mb-8">
+    <h1 class="text-headline-md font-headline-md font-extrabold text-primary tracking-tight">DiaVision AI</h1>
+    <p class="text-label-sm font-label-sm text-on-surface-variant uppercase tracking-widest mt-1">Intelligence Suite</p>
+  </div>
+  <nav class="flex-1 space-y-1">
+    <a class="nav-link {{ 'active' if request.endpoint=='dashboard' }}" href="{{ url_for('dashboard') }}">
+      <span class="material-symbols-outlined">dashboard</span><span class="text-label-sm font-label-sm">Dashboard</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint=='analysis' }}" href="{{ url_for('analysis') }}">
+      <span class="material-symbols-outlined">add_chart</span><span class="text-label-sm font-label-sm">New Analysis</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint in ['patients','patient_profile'] }}" href="{{ url_for('patients') }}">
+      <span class="material-symbols-outlined">group</span><span class="text-label-sm font-label-sm">Patients</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint=='history' }}" href="{{ url_for('history') }}">
+      <span class="material-symbols-outlined">history</span><span class="text-label-sm font-label-sm">Prediction History</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint in ['reports'] }}" href="{{ url_for('reports') }}">
+      <span class="material-symbols-outlined">description</span><span class="text-label-sm font-label-sm">Reports</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint=='analytics' }}" href="{{ url_for('analytics') }}">
+      <span class="material-symbols-outlined">analytics</span><span class="text-label-sm font-label-sm">Analytics</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint=='chatbot' }}" href="{{ url_for('chatbot') }}">
+      <span class="material-symbols-outlined">psychology</span><span class="text-label-sm font-label-sm">AI Assistant</span></a>
+    <a class="nav-link {{ 'active' if request.endpoint=='developer' }}" href="{{ url_for('developer') }}">
+      <span class="material-symbols-outlined">contact_support</span><span class="text-label-sm font-label-sm">Developer &amp; Support</span></a>
+  </nav>
+  <div class="px-4 mt-auto pt-6 border-t border-white/5">
+    <a href="{{ url_for('analysis') }}" class="w-full bg-primary text-on-primary py-3 rounded-xl font-semibold flex items-center justify-center gap-2 hover:opacity-90 transition-opacity">
+      <span class="material-symbols-outlined text-lg">add</span> Run New Diagnosis
+    </a>
+    <div class="mt-6 space-y-1">
+      <a class="flex items-center gap-3 text-on-surface-variant px-4 py-2 hover:text-white transition-colors" href="{{ url_for('logout') }}">
+        <span class="material-symbols-outlined">logout</span><span class="text-label-sm font-label-sm">Logout</span></a>
+    </div>
+  </div>
+</aside>
+
+<header class="md:ml-64 bg-black/60 backdrop-blur-2xl border-b border-white/5 h-16 flex justify-between items-center px-margin-desktop sticky top-0 z-40">
+  <div class="flex items-center gap-4">
+    <h1 class="md:hidden text-headline-md font-headline-md font-extrabold text-primary">DiaVision AI</h1>
+    {% block header_left %}<div class="hidden md:block text-body-md text-on-surface-variant">{% block page_title %}{% endblock %}</div>{% endblock %}
+  </div>
+  <div class="flex items-center gap-6">
+
+    <!-- Developer / support icons: LinkedIn, Instagram, Call, Support page -->
+    <div class="hidden sm:block">
+      {% include "_developer_navbar.html" %}
+    </div>
+
+    <div class="hidden lg:flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full bg-secondary animate-pulse"></span>
+      <span class="text-label-sm text-on-surface-variant">System Status: Active</span>
+    </div>
+    <div class="flex items-center gap-3 border-l border-white/10 pl-6">
+      <div class="text-right hidden sm:block">
+        <p class="text-label-sm font-semibold text-on-surface">{{ current_user.name }}</p>
+        <p class="text-[10px] text-on-surface-variant uppercase tracking-tighter">{{ current_user.role }}</p>
+      </div>
+      <div class="w-9 h-9 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold border border-primary/30">
+        {{ current_user.name[0] if current_user.name else "?" }}
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="md:ml-64 p-margin-desktop space-y-gutter min-h-[calc(100vh-4rem)]">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="space-y-2">
+      {% for category, message in messages %}
+        <div class="rounded-xl px-4 py-3 text-body-md border
+          {{ 'bg-error/10 border-error/30 text-error' if category=='error' else 'bg-secondary/10 border-secondary/30 text-secondary' }}">
+          {{ message }}
+        </div>
+      {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+</main>
+
+{% include "_footer.html" %}
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

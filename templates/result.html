@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block title %}Result | DiaVision AI{% endblock %}
+{% block page_title %}Screening Result{% endblock %}
+
+{% block content %}
+<div class="bg-error/10 border border-error/20 rounded-xl p-4 flex items-start gap-4">
+  <span class="material-symbols-outlined text-error mt-0.5" style="font-variation-settings:'FILL' 1;">warning</span>
+  <div>
+    <p class="text-body-md font-semibold text-error">Medical Disclaimer</p>
+    <p class="text-label-sm text-on-surface-variant leading-relaxed">This AI-generated analysis is intended for clinical decision support only and does not constitute a final medical diagnosis. All results must be reviewed by a board-certified healthcare professional before treatment planning.</p>
+  </div>
+</div>
+
+<div class="grid grid-cols-12 gap-gutter">
+  <div class="col-span-12 lg:col-span-5 glass-card rounded-2xl p-8 amethyst-glow flex flex-col justify-between">
+    <div>
+      <div class="flex justify-between items-start mb-6">
+        <span class="bg-primary/10 text-primary text-label-sm px-3 py-1 rounded-full border border-primary/20 uppercase tracking-widest">Primary Finding</span>
+        <span class="text-on-surface-variant text-[12px] font-mono opacity-60">ID: DV-{{ record.id }}</span>
+      </div>
+      <h3 class="text-headline-lg font-headline-lg text-white mb-3">{{ record.prediction_label }}</h3>
+
+      {% if verdict %}
+        {% set is_ok = (verdict == 'Not affected') %}
+        <div class="mb-4 rounded-2xl p-4"
+             style="background: {{ 'rgba(34,197,94,0.10)' if is_ok else 'rgba(239,68,68,0.12)' }}; border: 1px solid {{ 'rgba(34,197,94,0.35)' if is_ok else 'rgba(239,68,68,0.4)' }};">
+          <div class="flex items-center gap-3" style="color: {{ '#4ade80' if is_ok else '#f87171' }};">
+            <span class="material-symbols-outlined text-[28px]" style="font-variation-settings:'FILL' 1;">{{ 'check_circle' if is_ok else 'error' }}</span>
+            <span class="text-[20px] font-bold uppercase tracking-wider">{{ verdict }}</span>
+          </div>
+          <p class="text-label-sm text-on-surface-variant mt-2 leading-relaxed">
+            {{ summary.banner }}
+          </p>
+        </div>
+      {% else %}
+        <p class="text-label-sm text-on-surface-variant/70 mb-4">Affected / not affected is not set up for this model yet.
+          <a class="text-primary hover:underline" href="{{ url_for('class_setup') }}">Set up classes &rarr;</a></p>
+      {% endif %}
+
+      <p class="text-on-surface-variant mb-6 leading-relaxed">Patient:
+        <a class="text-primary hover:underline" href="{{ url_for('patient_profile', patient_id=patient.id) }}">{{ patient.name }}</a> ({{ patient.patient_code }})
+      </p>
+    </div>
+    <div class="flex items-center gap-6 bg-black/40 p-6 rounded-2xl border border-white/5">
+      <div class="relative w-28 h-28 rounded-full flex items-center justify-center"
+           style="background: radial-gradient(closest-side, #0a0a0a 79%, transparent 0), conic-gradient(#8b5cf6 {{ (record.confidence*360)|round(0) }}deg, #1a1a1e 0);">
+        <div class="text-center">
+          <span class="block text-headline-md font-headline-md text-primary">{{ (record.confidence*100)|round(1) }}%</span>
+          <span class="text-[10px] text-on-surface-variant uppercase">Confidence</span>
+        </div>
+      </div>
+      <div class="flex-1 text-label-sm text-on-surface-variant space-y-2">
+        {% set c = record.confidence * 100 %}
+        <p>Confidence level: <span class="font-semibold" style="color: {{ '#4ade80' if c >= 85 else ('#fbbf24' if c >= 60 else '#f87171') }};">{{ 'High' if c >= 85 else ('Moderate' if c >= 60 else 'Low - review manually') }}</span></p>
+        <p>Reviewed by: <span class="text-white">{{ record.reviewed_by or 'Pending' }}</span></p>
+        <p>Screened: <span class="text-white">{{ record.created_at.strftime('%b %d, %Y %H:%M') }}</span></p>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-span-12 lg:col-span-7 glass-card rounded-2xl p-8">
+    <h4 class="text-headline-md font-headline-md text-white mb-6">Classification Breakdown</h4>
+    <div class="space-y-5">
+      {% for label, prob in sorted_probs %}
+        <div class="space-y-2">
+          <div class="flex justify-between text-label-sm">
+            <span class="{{ 'text-white font-semibold' if loop.first else 'text-on-surface-variant' }}">{{ label }}</span>
+            <span class="{{ 'text-primary font-bold' if loop.first else 'text-on-surface-variant opacity-60' }}">{{ (prob*100)|round(1) }}%</span>
+          </div>
+          <div class="relative h-8 w-full bg-black/40 rounded-lg overflow-hidden border border-white/5">
+            <div class="absolute inset-y-0 left-0 {{ 'bg-gradient-to-r from-primary/20 to-primary/80' if loop.first else 'bg-white/10' }}" style="width:{{ (prob*100)|round(1) }}%"></div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="col-span-12 glass-card rounded-2xl p-8">
+    <div class="flex items-center gap-2 mb-5">
+      <span class="material-symbols-outlined text-primary">clinical_notes</span>
+      <h4 class="text-headline-md font-headline-md text-white" style="font-size:18px;">Clinical Interpretation</h4>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+      <div>
+        <p class="text-label-sm uppercase tracking-widest text-on-surface-variant mb-2">Impression</p>
+        <p class="text-body-md text-white font-semibold mb-3 leading-relaxed">{{ summary.impression }}</p>
+        <p class="text-on-surface-variant leading-relaxed">{{ summary.statement }}</p>
+        {% if summary.caution %}
+        <p class="mt-3 text-label-sm leading-relaxed" style="color:#fbbf24;">Note: {{ summary.caution }}</p>
+        {% endif %}
+      </div>
+      <div>
+        <p class="text-label-sm uppercase tracking-widest text-on-surface-variant mb-2">Suggested next steps</p>
+        <ul class="text-on-surface-variant leading-relaxed" style="list-style:disc;padding-left:1.25rem;">
+          {% for rec in summary.recommendations %}
+          <li style="margin-bottom:0.35rem;">{{ rec }}</li>
+          {% endfor %}
+        </ul>
+        <p class="text-label-sm text-on-surface-variant/60 mt-3">General guidance for consideration by the treating clinician.</p>
+      </div>
+    </div>
+  </div>
+
+  {% if heat_filename %}
+  <div class="col-span-12 glass-card rounded-2xl p-6">
+    <div class="flex items-center gap-2 mb-4">
+      <span class="material-symbols-outlined text-secondary">psychology_alt</span>
+      <h4 class="text-headline-md font-headline-md text-white" style="font-size:18px;">Visual Evidence (Grad-CAM)</h4>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <figure class="space-y-2">
+        <div class="aspect-square rounded-xl overflow-hidden border border-white/10 bg-black flex items-center justify-center">
+          <img class="max-h-full max-w-full object-contain" src="{{ url_for('uploaded_file', filename=record.image_filename) }}" alt="Submitted image">
+        </div>
+        <figcaption class="text-label-sm text-on-surface-variant text-center">(a) Image</figcaption>
+      </figure>
+      <figure class="space-y-2">
+        <div class="aspect-square rounded-xl overflow-hidden border border-white/10 bg-black flex items-center justify-center">
+          <img class="max-h-full max-w-full object-contain" src="{{ url_for('uploaded_file', filename=heat_filename) }}" alt="Grad-CAM heatmap">
+        </div>
+        <figcaption class="text-label-sm text-on-surface-variant text-center">(b) Grad-CAM heatmap</figcaption>
+      </figure>
+      <figure class="space-y-2">
+        <div class="aspect-square rounded-xl overflow-hidden border border-white/10 bg-black flex items-center justify-center">
+          <img class="max-h-full max-w-full object-contain" src="{{ url_for('uploaded_file', filename=record.gradcam_filename) }}" alt="Superimposed visualization">
+        </div>
+        <figcaption class="text-label-sm text-on-surface-variant text-center">(c) Superimposed visualization</figcaption>
+      </figure>
+    </div>
+    <div class="mt-5 flex flex-col items-center gap-2">
+      <div class="flex items-center gap-3 text-[11px] text-on-surface-variant/80">
+        <span>0.0 Low</span>
+        <div style="width:260px;height:10px;border-radius:5px;background:linear-gradient(90deg,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000);"></div>
+        <span>High 1.0</span>
+      </div>
+      <p class="text-label-sm text-on-surface-variant/70 text-center max-w-2xl leading-relaxed">
+        Grad-CAM computed for the predicted class: <b class="text-white">{{ record.prediction_label }}</b>
+        ({{ (record.confidence*100)|round(1) }}%). Colours show relative influence, normalised for each image
+        (0 = lowest, 1 = highest). It is a guide to the model's attention, not an outline of the lesion.
+      </p>
+    </div>
+  </div>
+  {% else %}
+  <div class="col-span-12 glass-card rounded-2xl p-6">
+    <div class="flex items-center gap-2 mb-4">
+      <span class="material-symbols-outlined text-secondary">psychology_alt</span>
+      <h4 class="text-headline-md font-headline-md text-white" style="font-size:18px;">Visual Evidence (Grad-CAM)</h4>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div class="space-y-2">
+        <p class="text-label-sm text-on-surface-variant text-center uppercase tracking-widest font-semibold">Submitted Image</p>
+        <div class="aspect-video rounded-xl overflow-hidden border border-white/10 bg-black flex items-center justify-center">
+          <img class="max-h-full max-w-full object-contain" src="{{ url_for('uploaded_file', filename=record.image_filename) }}" alt="Submitted image">
+        </div>
+      </div>
+      <div class="space-y-2">
+        <p class="text-label-sm text-on-surface-variant text-center uppercase tracking-widest font-semibold">Grad-CAM Heatmap</p>
+        {% if record.gradcam_filename %}
+        <div class="aspect-video rounded-xl overflow-hidden border border-white/10 bg-black flex items-center justify-center">
+          <img class="max-h-full max-w-full object-contain" src="{{ url_for('uploaded_file', filename=record.gradcam_filename) }}" alt="Grad-CAM heatmap overlay">
+        </div>
+        <p class="text-label-sm text-on-surface-variant/70 text-center">Warmer areas show where the model focused most for this prediction.</p>
+        <div class="flex items-center gap-3 justify-center text-[11px] text-on-surface-variant/70">
+          <span>Low influence</span>
+          <div style="width:140px;height:8px;border-radius:4px;background:linear-gradient(90deg,#1e3a8a,#06b6d4,#facc15,#ef4444);"></div>
+          <span>High influence</span>
+        </div>
+        {% else %}
+        <div class="aspect-video rounded-xl border border-dashed border-white/10 bg-black/40 flex flex-col items-center justify-center gap-2 p-4 text-center">
+          <span class="material-symbols-outlined text-error">build</span>
+          <p class="text-body-md font-semibold text-error">Grad-CAM unavailable — technical issue</p>
+          <p class="text-label-sm text-on-surface-variant leading-relaxed">{{ record.gradcam_error or "Could not generate a visualization for this model." }}</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="col-span-12 grid grid-cols-1 md:grid-cols-2 gap-gutter">
+    <a href="{{ url_for('download_report', analysis_id=record.id) }}" class="flex-1 glass-card rounded-2xl p-6 flex items-center gap-4 hover:bg-primary/5 transition-all border-primary/20">
+      <div class="w-14 h-14 bg-primary/10 rounded-full flex items-center justify-center">
+        <span class="material-symbols-outlined text-primary text-2xl">picture_as_pdf</span>
+      </div>
+      <div>
+        <p class="text-headline-md font-headline-md text-white" style="font-size:18px;">Download Report (PDF)</p>
+        <p class="text-label-sm text-on-surface-variant mt-1">Formatted clinical summary</p>
+      </div>
+    </a>
+    <a href="{{ url_for('patient_profile', patient_id=patient.id) }}" class="flex-1 glass-card rounded-2xl p-6 flex items-center gap-4 hover:bg-white/5 transition-all">
+      <div class="w-14 h-14 bg-white/5 rounded-full flex items-center justify-center">
+        <span class="material-symbols-outlined text-on-surface-variant text-2xl">group</span>
+      </div>
+      <div>
+        <p class="text-headline-md font-headline-md text-white" style="font-size:18px;">View Patient Record</p>
+        <p class="text-label-sm text-on-surface-variant mt-1">Full screening history</p>
+      </div>
+    </a>
+  </div>
+</div>
+{% endblock %}

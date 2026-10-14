@@ -1,0 +1,10 @@
+{
+  "names": [
+    "Affected",
+    "Not affected",
+    "Other (or its real meaning)"
+  ],
+  "not_affected": [
+    "Not affected"
+  ]
+}
