@@ -1,0 +1,8 @@
+venv/
+.env
+*.bak
+*.bak2
+*.bak3
+diavision.db
+__pycache__/
+.git/
